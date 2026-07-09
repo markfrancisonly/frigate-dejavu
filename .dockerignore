@@ -1,0 +1,5 @@
+# Build context allowlist: the image only needs the app source + requirements.
+*
+!app/
+!app/**
+!requirements.txt
