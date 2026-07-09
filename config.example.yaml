@@ -1,0 +1,140 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Frigate Déjà Vu — example appliance configuration.
+#
+# Copy this to `config.yaml` (gitignored) and adjust. Defaults are sensible; for
+# most setups you only touch two things:
+#   • frigate.* URLs — only if your Frigate container isn't named `frigate`
+#   • profiles.*     — your camera names (the lists below are placeholders)
+# Everything under `capture:` is tuning. See SPEC.md §11 for the full reference.
+# ─────────────────────────────────────────────────────────────────────────────
+
+frigate:
+  api_url: http://frigate:5000          # Frigate internal (unauthenticated) API
+  go2rtc_api_url: http://frigate:1984   # embedded go2rtc API (verification)
+  restream_url: rtsp://frigate:8554     # capture source (go2rtc restream)
+  container_name: frigate               # docker fallback restart target
+  restart_method: api                   # api | docker
+  restart_fallback: true                # docker restart if verify fails after api restart
+  swap_method: go2rtc                   # go2rtc: reload ONLY the embedded go2rtc
+                                        #   service (frigate's detect/record/DB never
+                                        #   restart; streams reconnect in seconds);
+                                        #   restart: full frigate restart (also the
+                                        #   automatic fallback when go2rtc can't verify)
+  health_timeout_seconds: 300           # tensorrt cold boots have taken ~3min; the
+                                        # gate extends rather than panics on expiry
+  settle_timeout_seconds: 240           # before sourcing from recordings, wait for
+                                        # frigate's export API to answer — it lags
+                                        # /api/version by minutes after a restart
+  api_auth:                             # optional — only when api_url targets Frigate's
+    token: ""                           #   authenticated port (8971). Bearer token wins;
+    user: ""                            #   else user/password logs in via /api/login and
+    password: ""                        #   rides the JWT cookie (env overrides:
+                                        #   DEJAVU_FRIGATE_TOKEN / _USER / _PASSWORD)
+
+# Container-internal paths — these pair with the volume mounts in compose.yaml;
+# leave them unless you changed the right-hand (container) side of a mount there.
+paths:
+  clips_local: /clips                   # this container's view of the clips dir
+  clips_frigate: /config/dejavu-clips  # the same dir as frigate/go2rtc sees it
+  recordings_dir: /recordings           # frigate's segment files (ro mount) — clip
+                                        #   sourcing reads these directly; export API
+                                        #   is the automatic fallback
+  state_dir: /data/state
+  tmp_dir: /data/tmp
+
+capture:
+  # Two-phase engage (SPEC §5c). Privacy engages INSTANTLY with a live freeze
+  # frame — a frame of the scene right now — so it can never wait on, or be
+  # defeated by, a slow window search. Then, in loop mode, the appliance searches
+  # the camera's own recent recordings for a window it can loop without a human
+  # noticing and upgrades the stream in place. A stream is NEVER left live: the
+  # freeze frame is the worst case, and it still provides privacy.
+  source: recordings          # recordings (loop upgrade sourced from Frigate's own
+                              #   recordings) | restream (loop from a live capture)
+  seconds: 300                # target loop length. LONGER is better: a car passing
+                              #   once in 5 min reads as ordinary; the same car every
+                              #   20s is an obvious loop. Absolute quiet is preferred,
+                              #   but fooling the eye beats a short perfect loop.
+  max_loop_seconds: 1200      # cap on how long a single loop window may grow (20 min)
+  freeze_clip_seconds: 4      # length of the synthesized still clip (freeze frame)
+  rtsp_query: mp4             # codec-filter query appended when capturing (matches camera inputs)
+  parallel: 4                 # concurrent loop-window searches (phase 2)
+  parallel_frames: 8          # concurrent live frame grabs (phase 1 — cheap, engage fast)
+  engage_deadline_seconds: 15 # if the loop search finishes within this, engage on the
+                              #   loops directly (one swap); else engage on freeze
+                              #   frames now and upgrade in the background
+  keep_clips_after_off: false
+  recordings:
+    search_hours: 4           # lookback limit for the loop search — bounded "within
+                              #   reason"; the brightness guards police lighting
+                              #   staleness inside the window
+    min_seconds: 20           # busy cams: shortest acceptable quiet loop when no
+                              #   full-length window exists
+    audio: silence            # silence (default: no repeating-sound loop tell) | keep | strip
+    max_brightness_delta: 60  # reject candidate if its mean luma differs from the
+                              #   camera's LIVE frame by more (0-255; 0 disables) —
+                              #   catches day/night/IR mismatch regardless of age
+    max_brightness_drift: 20  # reject windows whose brightness changes more than this
+                              #   first-to-last frame (dawn/dusk inside the window
+                              #   would pulse every loop; 0 disables)
+    match_ir_mode: true       # chromatic day/night guard: IR switchover keeps luma
+                              #   day-like (IR illuminators) but goes monochrome —
+                              #   candidates must match the live frame's color-vs-IR
+                              #   mode, and loop windows must not contain the flip
+    sync_tolerance_minutes: 10  # overlapping cameras loop the SAME moment: windows
+                              #   are picked against a common anchor time (frigate's
+                              #   server timeline); 0 disables sync
+    dilute:                   # when no absolutely-quiet window is long enough, accept
+                              #   a longer window with sparse transient activity — the
+                              #   repetition period, not the passing car, is the tell
+      enabled: true
+      min_seconds: 300        # a diluted window must be at least this long (>= a car
+                              #   is rare enough per loop to read as ordinary)
+      max_activity_fraction: 0.10  # at most this fraction of the loop may contain a
+                              #   tracked object / event (0-0.5)
+      block_labels: [person]  # never loop a window containing these — replaying a
+                              #   person is a disclosure AND the biggest tell (required
+                              #   to include 'person')
+
+# Global rails, applied AFTER camera -> stream resolution (glob patterns on
+# go2rtc stream names). include empty = allow all.
+streams:
+  include: []
+  exclude:
+    - camera.birdseye         # frigate-generated composite; loops the loops anyway
+  # tablets/wallpanels are INCLUDED: they are inbound WebRTC publishers pointed
+  # at people, and the configured (privacy) source wins over a live publisher
+  # for new consumers — verified live.
+
+# Profiles select frigate CAMERA names (empty list = ALL cameras), a mode and
+# optionally a source. Entries prefixed "stream:" name a go2rtc stream directly
+# (escape hatch). Request-time overrides: --mode / --cameras / --capture-seconds
+# / --source.
+#
+# loop   = engage on a live freeze frame, then upgrade to a replay of an
+#          event-clear window from the camera's own recent past (scene keeps its
+#          usual micro-motion; no repeating motion/audio tell — the default).
+# freeze = engage on the live freeze frame and STAY there for the whole session
+#          (no loop upgrade — a truly frozen scene).
+profiles:
+  # `default` is the required CLI/unspecified fallback (== all cameras).
+  default:
+    mode: loop                # loop | freeze
+    cameras: []               # all cameras
+
+  # Named profiles you can trigger by name (e.g. from Home Assistant switches).
+  # EDIT: replace these placeholder camera names with your Frigate camera names.
+  perimeter:                  # example: outdoor cameras
+    mode: loop
+    cameras: [front_door, driveway, backyard, side_gate]
+  indoor:                     # example: indoor cameras (incl. any tablet/wallpanel feeds)
+    mode: loop
+    cameras: [living_room, hallway, garage]
+  all:                        # every camera
+    mode: loop
+    cameras: []
+
+api:
+  listen: 0.0.0.0:8898
+  bearer_token: ""            # empty = auth disabled; prefer DEJAVU_API_TOKEN env
+  debounce_seconds: 5

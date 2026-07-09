@@ -1,0 +1,23 @@
+# ── Allowlist model ────────────────────────────────────────────────────────
+# Ignore everything at the root by default, then re-include ONLY what ships
+
+/*
+
+# Public, shipped files:
+!/.github/
+!/.gitignore
+!/.dockerignore
+!/.env.example
+!/Dockerfile
+!/LICENSE
+!/README.md
+!/SPEC.md
+!/compose.example.yaml
+!/config.example.yaml
+!/requirements.txt
+!/up.sh
+!/app/
+
+# ...but never Python caches, even inside allowed directories:
+__pycache__/
+*.py[cod]
