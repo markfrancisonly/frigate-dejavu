@@ -12,14 +12,6 @@ frigate:
   api_url: http://frigate:5000          # Frigate internal (unauthenticated) API
   go2rtc_api_url: http://frigate:1984   # embedded go2rtc API (verification)
   restream_url: rtsp://frigate:8554     # capture source (go2rtc restream)
-  container_name: frigate               # docker fallback restart target
-  restart_method: api                   # api | docker
-  restart_fallback: true                # docker restart if verify fails after api restart
-  swap_method: go2rtc                   # go2rtc: reload ONLY the embedded go2rtc
-                                        #   service (frigate's detect/record/DB never
-                                        #   restart; streams reconnect in seconds);
-                                        #   restart: full frigate restart (also the
-                                        #   automatic fallback when go2rtc can't verify)
   health_timeout_seconds: 300           # tensorrt cold boots have taken ~3min; the
                                         # gate extends rather than panics on expiry
   settle_timeout_seconds: 240           # before sourcing from recordings, wait for
@@ -38,18 +30,18 @@ paths:
   clips_frigate: /config/dejavu-clips  # the same dir as frigate/go2rtc sees it
   recordings_dir: /recordings           # frigate's segment files (ro mount) — clip
                                         #   sourcing reads these directly; export API
-                                        #   is the automatic fallback
+                                        #   retries missing/unreadable candidates and
+                                        #   failed direct assembly automatically
   state_dir: /data/state
   tmp_dir: /data/tmp
 
 capture:
-  # Two-phase engage (SPEC §5c). Privacy engages INSTANTLY with a live freeze
-  # frame — a frame of the scene right now — so it can never wait on, or be
-  # defeated by, a slow window search. Then, in loop mode, the appliance searches
-  # the camera's own recent recordings for a window it can loop without a human
-  # noticing and upgrades the stream in place. A stream is NEVER left live: the
-  # freeze frame is the worst case, and it still provides privacy.
-  source: recordings          # recordings (loop upgrade sourced from Frigate's own
+  # With the production recordings source, each stream first gets a safe freeze
+  # fallback. Loop searches run in parallel and successful clips are atomically
+  # promoted before one coordinated Frigate restart. A stream is NEVER left
+  # live: if no suitable loop is found, its freeze frame is used. The opt-in
+  # restream loop source directly captures live video and aborts if capture fails.
+  source: recordings          # recordings (loop search sourced from Frigate's own
                               #   recordings) | restream (loop from a live capture)
   seconds: 300                # target loop length. LONGER is better: a car passing
                               #   once in 5 min reads as ordinary; the same car every
@@ -58,11 +50,8 @@ capture:
   max_loop_seconds: 1200      # cap on how long a single loop window may grow (20 min)
   freeze_clip_seconds: 4      # length of the synthesized still clip (freeze frame)
   rtsp_query: mp4             # codec-filter query appended when capturing (matches camera inputs)
-  parallel: 4                 # concurrent loop-window searches (phase 2)
-  parallel_frames: 8          # concurrent live frame grabs (phase 1 — cheap, engage fast)
-  engage_deadline_seconds: 15 # if the loop search finishes within this, engage on the
-                              #   loops directly (one swap); else engage on freeze
-                              #   frames now and upgrade in the background
+  parallel: 4                 # concurrent loop-window searches
+  parallel_frames: 8          # concurrent live frame grabs for freeze fallbacks
   keep_clips_after_off: false
   recordings:
     search_hours: 4           # lookback limit for the loop search — bounded "within
@@ -106,16 +95,17 @@ streams:
   # at people, and the configured (privacy) source wins over a live publisher
   # for new consumers — verified live.
 
-# Profiles select frigate CAMERA names (empty list = ALL cameras), a mode and
-# optionally a source. Entries prefixed "stream:" name a go2rtc stream directly
+# Profiles select frigate CAMERA names (empty list = ALL cameras), plus optional
+# mode and source values. Entries prefixed "stream:" name a go2rtc stream directly
 # (escape hatch). Request-time overrides: --mode / --cameras / --capture-seconds
 # / --source.
 #
-# loop   = engage on a live freeze frame, then upgrade to a replay of an
-#          event-clear window from the camera's own recent past (scene keeps its
-#          usual micro-motion; no repeating motion/audio tell — the default).
-# freeze = engage on the live freeze frame and STAY there for the whole session
-#          (no loop upgrade — a truly frozen scene).
+# loop   = prepare a safe freeze fallback, search for an event-clear window from
+#          the camera's recent past, then activate the finalized loop (or the
+#          freeze fallback) with one Frigate restart.
+# freeze = prepare a freeze clip and activate it with one Frigate restart; no
+#          recordings search. If mode is omitted from a profile, freeze is the
+#          safe default.
 profiles:
   # `default` is the required CLI/unspecified fallback (== all cameras).
   default:

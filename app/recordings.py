@@ -1,8 +1,8 @@
 """Loop/freeze clip sourcing from Frigate's own recordings (SPEC §5b).
 
-Dejavu is engaged instantly with a live freeze frame (SPEC §5c); this module
-finds the *upgrade*: a window of the camera's own recent past that can be
-looped without a human noticing. Absolute quiet is the ideal, but the thing
+Dejavu first prepares a live freeze frame (SPEC §5c); this module finds a
+better replacement before activation: a window of the camera's own recent past
+that can be looped without a human noticing. Absolute quiet is the ideal, but the thing
 that actually gives a loop away is REPETITION — so a long window in which a
 car passes once beats a short window in which a bush sways every 20 s.
 
@@ -207,16 +207,25 @@ def _slide_diluted(segs, need, max_seconds, max_frac, spans, now, per_run_cap=4)
             j + 1 < n and segs[j + 1]["end_time"] - segs[i]["start_time"] <= max_seconds
         ):
             j += 1
-        duration = segs[j]["end_time"] - segs[i]["start_time"]
-        if duration < need - SEGMENT_JITTER:
+        # The longest duration-limited window is not necessarily acceptable: a
+        # busy tail can push its activity fraction over the limit while a shorter
+        # prefix is valid. Walk back to the longest endpoint that satisfies both.
+        chosen = None
+        for end_idx in range(j, i - 1, -1):
+            duration = segs[end_idx]["end_time"] - segs[i]["start_time"]
+            if duration < need - SEGMENT_JITTER:
+                break
+            frac = (active[end_idx + 1] - active[i]) / max(duration, 1)
+            if frac <= max_frac:
+                chosen = (end_idx, duration, frac)
+                break
+        if chosen is None:
             continue
-        frac = (active[j + 1] - active[i]) / max(duration, 1)
-        if frac > max_frac:
-            continue
-        bucket = int((now - segs[j]["end_time"]) // 3600)
+        end_idx, duration, frac = chosen
+        bucket = int((now - segs[end_idx]["end_time"]) // 3600)
         prev = best.get(bucket)
         if prev is None or (frac, -duration) < (prev[0], -prev[1]):
-            best[bucket] = (frac, duration, segs[i : j + 1])
+            best[bucket] = (frac, duration, segs[i : end_idx + 1])
     ordered = sorted(best.items())[:per_run_cap]
     # a slice that turned out to hold no activity at all IS a quiet window; the
     # slide just found it somewhere other than the run's tail
@@ -260,7 +269,7 @@ def find_candidate_windows(
     `dilute` = {"enabled","min_seconds","max_activity_fraction","block_labels"}
     or None to consider quiet windows only."""
     dilute = dilute or {}
-    block = {l.lower() for l in (dilute.get("block_labels") or ["person"])}
+    block = {label.lower() for label in (dilute.get("block_labels") or ["person"])}
     max_seconds = max_seconds or max(target_seconds, min_seconds)
 
     def quiet(seg):
@@ -301,15 +310,14 @@ def find_candidate_windows(
             seen[key] = c
             deduped.append(c)
 
-    # Hour-age bucket FIRST: it is the proxy for the current lighting regime, and
-    # a candidate from another regime is one the IR/brightness guards will only
-    # reject after paying for a probe. Within one regime: better tier, then the
-    # LONGEST window (repetition, not the passing car, is what gives a loop away),
-    # then least motion, then most recent.
+    # Quality tier FIRST: a recent 20-30 second loop is much more obvious than a
+    # longer quiet/diluted window from an earlier hour. The lighting guards are
+    # the authoritative regime check and cheaply reject stale day/night matches.
+    # Within a tier: recent lighting bucket, longest, least motion, newest.
     deduped.sort(
         key=lambda c: (
-            int((now - c["end"]) // 3600),
             c["tier"],
+            int((now - c["end"]) // 3600),
             -c["duration"],
             c["motion_ps"],
             -c["end"],
@@ -395,38 +403,75 @@ def segment_files(recordings_dir, camera, win, now=None):
     return paths
 
 
+def _direct_audio_action(policy, want_audio, meta):
+    """Resolve the final audio shape before the one-pass segment assembly."""
+    has_audio = bool(meta.get("audio_codec"))
+    if want_audio is True:
+        return "keep" if policy == "keep" and has_audio else "silence"
+    if want_audio is False:
+        return "strip"
+    return {"silence": "silence", "strip": "strip"}.get(policy, "keep")
+
+
 def _fetch_window_via_files(
-    recordings_dir, camera, stream, win, tmp_dir, cancel, progress, now
+    recordings_dir,
+    camera,
+    stream,
+    win,
+    tmp_dir,
+    cancel,
+    progress,
+    now,
+    out_path=None,
+    audio_policy=None,
+    want_audio=None,
 ):
     paths = segment_files(recordings_dir, camera, win)
     progress(
         stream, f"reading {len(paths)} segment file(s) — {describe_window(win, now)}"
     )
-    tmp_clip = os.path.join(tmp_dir, f"{stream}.export.mp4")
+    tmp_clip = out_path or os.path.join(tmp_dir, f"{stream}.export.mp4")
+    source_meta = (
+        summarize_probe(probe_file(paths[0])) if audio_policy is not None else None
+    )
+    action = (
+        _direct_audio_action(audio_policy, want_audio, source_meta)
+        if source_meta is not None
+        else None
+    )
     list_path = os.path.join(tmp_dir, f"{stream}.segments.txt")
     with open(list_path, "w") as f:
         for p in paths:
             f.write(f"file '{p}'\n")
-    try:
-        _run(
-            FFMPEG_BASE
-            + [
+    cmd = FFMPEG_BASE + ["-f", "concat", "-safe", "0", "-i", list_path]
+    if audio_policy is None:
+        cmd += ["-c", "copy"]
+    else:
+        if action == "silence":
+            layout = "mono" if (source_meta.get("channels") or 1) == 1 else "stereo"
+            rate = source_meta.get("sample_rate") or 48000
+            cmd += [
                 "-f",
-                "concat",
-                "-safe",
-                "0",
+                "lavfi",
                 "-i",
-                list_path,
-                "-c",
+                f"anullsrc=channel_layout={layout}:sample_rate={rate}",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
                 "copy",
-                "-movflags",
-                "+faststart",
-                tmp_clip,
-            ],
-            CONCAT_TIMEOUT,
-            cancel,
-            f"segment concat {stream}",
-        )
+                "-c:a",
+                "aac",
+                "-shortest",
+            ]
+        elif action == "strip":
+            cmd += ["-map", "0:v:0", "-c:v", "copy", "-an"]
+        else:
+            cmd += ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"]
+    cmd += ["-movflags", "+faststart", tmp_clip]
+    try:
+        _run(cmd, CONCAT_TIMEOUT, cancel, f"segment concat {stream}")
     except BaseException:
         if os.path.exists(tmp_clip):
             os.unlink(tmp_clip)
@@ -546,10 +591,10 @@ def apply_audio_policy(src, dest, policy, meta, cancel, want_audio=None):
     """silence: same-codec-family silent AAC (no repeating-sound loop tell);
     keep: passthrough; strip: drop audio track.
 
-    `want_audio` pins the outcome regardless of policy. The loop upgrade reuses
-    the go2rtc source string the freeze clip was published under, and that
-    string encodes whether the clip carries audio — so the upgraded clip MUST
-    agree, or go2rtc serves a source that no longer matches its config."""
+    `want_audio` pins the outcome regardless of policy. The freeze fallback and
+    loop candidate share one planned go2rtc source string, which encodes whether
+    the finalized clip carries audio — so both clips MUST agree before
+    activation."""
     has_audio = bool(meta.get("audio_codec"))
     if want_audio is not None:
         if want_audio and not has_audio:
@@ -712,6 +757,7 @@ def plan_candidate_windows(
 # winner is ever stitched. The old top-5 cap screened 5 of 25 candidates.
 MAX_EXPORT_CANDIDATES = 5  # export API is slow + serialized: keep the cap there
 GUARD_BUDGET_SECONDS = 25  # wall-clock ceiling on screening one camera
+MAX_SEAM_CANDIDATES = 3  # compare a few equivalent survivors, not the whole search
 IR_CHROMA_THRESHOLD = 6.0  # shared pre-filter; below MAY be monochrome/IR
 # Probe-resolution-specific (16x16 cell averaging blends small colored objects,
 # so these are TIGHTER than cameralux's full-resolution 0.85/tol-2 constants):
@@ -761,6 +807,7 @@ def frame_stats(path, cancel=None, tail=False):
         "luma": 255.0 * (sum(keep) / len(keep)) ** PERCEPTION_EXPONENT,
         "chroma": sum(cell_chroma) / 256,
         "gray": sum(1 for c in cell_chroma if c <= IR_GRAY_CELL_TOLERANCE) / 256,
+        "signature": tuple(y),
     }
 
 
@@ -861,7 +908,7 @@ def _fetch_window_clip(
             log.warning(
                 "%s: direct segment read failed (%s) — using export API", stream, exc
             )
-    progress(stream, f"waiting for export slot")
+    progress(stream, "waiting for export slot")
     with _EXPORT_LOCK:
         if cancel:
             cancel.check()
@@ -935,26 +982,41 @@ def select_synced_windows(
         anchors = sorted(
             {round(w["end"]) for wins in per_cam.values() for w in wins}, reverse=True
         )  # most recent first
+        full_cap = sum(
+            any(w["tier"] != TIER_SHORT for w in wins) for wins in per_cam.values()
+        )
         for a in anchors:
             cov = sum(1 for wins in per_cam.values() if any(near(w, a) for w in wins))
-            # RECENCY-FIRST (hour buckets), coverage second: recency is the
-            # proxy for the current lighting regime — a stale max-coverage
-            # anchor (e.g. pre-sunset) drags every camera's candidates into
-            # frames the IR/brightness guards must reject (observed live).
-            key = (int((now - a) // 3600), -cov, -a)
+            full_cov = sum(
+                1
+                for wins in per_cam.values()
+                if any(w["tier"] != TIER_SHORT and near(w, a) for w in wins)
+            )
+            # Stay within the newest likely lighting regime, then maximize full
+            # quiet/diluted coverage. Short windows must not drag healthy cameras
+            # away from substantially better loops merely to share an anchor.
+            key = (int((now - a) // 3600), -full_cov, -cov, -a)
             if best_key is None or key < best_key:
                 anchor, best_key = a, key
-            if best_key[0] == 0 and cov == len(per_cam):
-                break  # full coverage within the current hour — done
+            if best_key[0] == 0 and full_cov == full_cap and cov == len(per_cam):
+                break
 
     ordered = {}
     for cam, wins in per_cam.items():
         if anchor is None:
             ordered[cam] = wins
             continue
-        synced = [w for w in wins if near(w, anchor)]
-        synced.sort(key=lambda w: (w["tier"], abs(w["end"] - anchor)))
-        ordered[cam] = synced + [w for w in wins if w not in synced]
+        synced_full = [w for w in wins if w["tier"] != TIER_SHORT and near(w, anchor)]
+        other_full = [
+            w for w in wins if w["tier"] != TIER_SHORT and w not in synced_full
+        ]
+        synced_short = [w for w in wins if w["tier"] == TIER_SHORT and near(w, anchor)]
+        other_short = [
+            w for w in wins if w["tier"] == TIER_SHORT and w not in synced_short
+        ]
+        synced_full.sort(key=lambda w: (w["tier"], abs(w["end"] - anchor)))
+        synced_short.sort(key=lambda w: abs(w["end"] - anchor))
+        ordered[cam] = synced_full + other_full + synced_short + other_short
     return anchor, ordered, errors
 
 
@@ -1019,6 +1081,14 @@ def _stable_across(first, last, rcfg, stream, win, now):
     return None
 
 
+def _seam_delta(first, last):
+    """Mean low-resolution luma difference across the loop boundary."""
+    a, b = first.get("signature"), last.get("signature")
+    if not a or not b or len(a) != len(b):
+        return None
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+
 def _lighting_ok(clip_or_frame, ref, rcfg, stream, win, now, cancel):
     """Guard a materialized clip/frame (export-API path). None or a reason."""
     return _matches_now(frame_stats(clip_or_frame, cancel), ref, rcfg, stream, win, now)
@@ -1030,16 +1100,17 @@ def screen_window_files(
     """Screen a candidate window by probing its LAST (and, only if that passes,
     FIRST) segment file — no concat, no export. Most candidates die on the
     vs-now guard, so the head probe is rarely paid for.
-    Returns None when the window survives every guard, else a reason string."""
+    Returns (reason_or_none, seam_delta_or_none)."""
     paths = segment_files(recordings_dir, camera, win, now)
     last = frame_stats_tail(paths[-1], cancel) or frame_stats(paths[-1], cancel)
     reason = _matches_now(last, ref, rcfg, stream, win, now)  # closest to now
     if reason:
-        return reason
-    if not check_drift or len(paths) == 1:
-        return None
+        return reason, None
+    if not check_drift:
+        return None, None
     head = frame_stats(paths[0], cancel)  # start of the loop
-    return _stable_across(head, last, rcfg, stream, win, now)
+    reason = _stable_across(head, last, rcfg, stream, win, now)
+    return reason, None if reason else _seam_delta(head, last)
 
 
 def _rejection_summary(rejections):
@@ -1060,6 +1131,8 @@ def _win_info(win):
         for k in ("start", "end", "duration", "full", "motion_ps", "activity_fraction")
     }
     info["tier"] = TIER_NAMES[win["tier"]]
+    if win.get("seam_delta") is not None:
+        info["seam_delta"] = round(win["seam_delta"], 3)
     return info
 
 
@@ -1076,16 +1149,21 @@ def _pick_window(
     recordings_dir,
     check_drift,
 ):
-    """Screen candidates cheaply (segment-file probes) and return the first
-    survivor, or (None, reasons). Only the survivor is ever stitched.
+    """Screen candidates cheaply and seam-rank equivalent survivors.
+
+    Only the selected survivor is stitched. Freeze-frame searches still return
+    the first lighting-matched candidate because a still has no loop seam.
 
     Per-candidate rejections log at DEBUG (job file); the operator log gets ONE
     grouped summary line per camera."""
     reasons = []
     if not files_retrieval_available(recordings_dir):
-        return None, reasons  # export path screens after materializing
+        return None, reasons, []  # export path screens after materializing
     deadline = time.monotonic() + GUARD_BUDGET_SECONDS
     picked = None
+    survivors = []
+    survivor_group = None
+    unavailable = []
     for i, win in enumerate(wins):
         if cancel:
             cancel.check()
@@ -1099,13 +1177,22 @@ def _pick_window(
             )
             reasons.append(f"guard budget spent after {i}/{len(wins)} candidates")
             break
+        group = (int((now - win["end"]) // 3600), win["tier"])
+        if survivors and group != survivor_group:
+            break  # preserve the existing recency/tier preference over seam quality
         try:
-            reason = screen_window_files(
+            reason, seam = screen_window_files(
                 recordings_dir, camera, win, ref, rcfg, stream, now, cancel, check_drift
             )
             if reason is None:
-                picked = win
-                break
+                if not check_drift:
+                    picked = win
+                    break
+                survivor_group = group
+                survivors.append(({**win, "seam_delta": seam}, seam))
+                if len(survivors) >= MAX_SEAM_CANDIDATES:
+                    break
+                continue
             reasons.append(reason)
         except Cancelled:
             raise
@@ -1114,6 +1201,17 @@ def _pick_window(
                 "%s: candidate %s unusable: %s", stream, describe_window(win, now), exc
             )
             reasons.append(str(exc))
+            unavailable.append(win)
+    if survivors:
+        picked, seam = min(
+            survivors, key=lambda item: item[1] if item[1] is not None else float("inf")
+        )
+        log.info(
+            "%s: seam-ranked %d candidate(s); picked endpoint delta %.1f",
+            stream,
+            len(survivors),
+            seam if seam is not None else -1,
+        )
     if reasons:
         log.info(
             "%s: rejected %d candidate(s): %s%s",
@@ -1126,7 +1224,7 @@ def _pick_window(
                 else " — no survivor (details at DEBUG in the job log)"
             ),
         )
-    return picked, reasons
+    return picked, reasons, unavailable
 
 
 def _resolve_candidates(
@@ -1158,6 +1256,25 @@ def _resolve_candidates(
         dilute=rcfg.get("dilute"),
         max_seconds=max_seconds,
     )
+
+
+def _exportable_windows(wins, now, reasons):
+    """Keep the direct-file fast path from feeding fresh windows to export.
+
+    Direct reads can safely use settled files only five seconds behind live,
+    while Frigate's export worker has wedged on windows less than 30 seconds
+    old. A per-candidate fallback must retain the stricter export margin.
+    """
+    safe = [win for win in wins if now - win["end"] >= EXPORT_RECENT_MARGIN]
+    skipped = len(wins) - len(safe)
+    if skipped:
+        reasons.append(f"{skipped} candidate(s) too recent for safe export")
+        log.debug(
+            "skipped %d direct-file fallback candidate(s) newer than %ss",
+            skipped,
+            EXPORT_RECENT_MARGIN,
+        )
+    return safe
 
 
 def _reference(api, camera, tmp_dir, rcfg, cancel, recordings_dir, ref):
@@ -1224,9 +1341,11 @@ def frame_from_recordings(
             raise CaptureError("frame extraction failed")
         return png, meta, win
 
+    export_wins = wins
+    reasons = []
     if files:
         # a still frame cannot pulse: no intra-window drift check
-        win, reasons = _pick_window(
+        win, reasons, unavailable = _pick_window(
             api,
             camera,
             stream,
@@ -1239,23 +1358,54 @@ def frame_from_recordings(
             recordings_dir,
             check_drift=False,
         )
-        if win is None:
+        if win is not None:
+            log.info("%s: freeze source %s", stream, describe_window(win, now))
+            try:
+                return extract(segment_files(recordings_dir, camera, win)[-1], win)
+            except CaptureError as exc:
+                reasons.append(str(exc))
+                log.warning(
+                    "%s: direct freeze extraction failed (%s) — trying Frigate "
+                    "export",
+                    stream,
+                    exc,
+                )
+                export_wins = [win]
+        elif unavailable:
+            export_wins = unavailable
+            log.warning(
+                "%s: %d direct recording candidate(s) unavailable — trying "
+                "Frigate export",
+                stream,
+                len(unavailable),
+            )
+        else:
             raise CaptureError(
                 f"no lighting-matched event-clear frame — {len(wins)} candidate(s), "
                 f"all rejected ({_rejection_summary(reasons) or 'none'}); "
                 "per-candidate detail at DEBUG in the job log"
             )
-        log.info("%s: freeze source %s", stream, describe_window(win, now))
-        return extract(segment_files(recordings_dir, camera, win)[-1], win)
 
-    reasons = []
-    for win in wins[:MAX_EXPORT_CANDIDATES]:
+    export_wins = _exportable_windows(export_wins, now, reasons)
+    for win in export_wins[:MAX_EXPORT_CANDIDATES]:
         if cancel:
             cancel.check()
-        tmp_clip = _fetch_window_clip(
-            api, camera, stream, win, tmp_dir, cancel, progress, now, recordings_dir
-        )
+        tmp_clip = None
         try:
+            # Reaching this path means direct files are absent or failed for
+            # this candidate. Force the Frigate export API rather than retrying
+            # the same direct path.
+            tmp_clip = _fetch_window_clip(
+                api,
+                camera,
+                stream,
+                win,
+                tmp_dir,
+                cancel,
+                progress,
+                now,
+                recordings_dir=None,
+            )
             reason = _lighting_ok(tmp_clip, ref, rcfg, stream, win, now, cancel)
             if reason:
                 reasons.append(reason)
@@ -1270,10 +1420,11 @@ def frame_from_recordings(
             )
             reasons.append(str(exc))
         finally:
-            if os.path.exists(tmp_clip):
+            if tmp_clip and os.path.exists(tmp_clip):
                 os.unlink(tmp_clip)
     raise CaptureError(
-        f"no lighting-matched event-clear frame — {min(len(wins), MAX_EXPORT_CANDIDATES)}"
+        f"no lighting-matched event-clear frame — "
+        f"{min(len(export_wins), MAX_EXPORT_CANDIDATES)}"
         f" export candidate(s) rejected ({_rejection_summary(reasons) or 'none'})"
     )
 
@@ -1317,7 +1468,7 @@ def source_clip_from_recordings(
     ref = _reference(api, camera, tmp_dir, rcfg, cancel, recordings_dir, ref)
     out_path = out_path or os.path.join(clips_dir, f"{stream}.dejavu.mp4")
 
-    def finish(tmp_clip, win):
+    def finish(tmp_clip, win, audio_ready=False):
         meta = summarize_probe(probe_file(tmp_clip))
         if not meta["video_codec"]:
             raise CaptureError("no video stream")
@@ -1326,11 +1477,19 @@ def source_clip_from_recordings(
                 f"clip too short ({meta['duration']:.1f}s "
                 f"< 90% of {win['duration']:.0f}s)"
             )
-        progress(stream, f"audio policy: {rcfg['audio']}")
-        has_audio = apply_audio_policy(
-            tmp_clip, out_path, rcfg["audio"], meta, cancel, want_audio
-        )
-        final_meta = summarize_probe(probe_file(out_path))
+        if audio_ready:
+            final_meta = meta
+            has_audio = bool(meta["audio_codec"])
+            if want_audio is not None and has_audio != want_audio:
+                raise CaptureError(
+                    "assembled clip audio does not match the active source"
+                )
+        else:
+            progress(stream, f"audio policy: {rcfg['audio']}")
+            has_audio = apply_audio_policy(
+                tmp_clip, out_path, rcfg["audio"], meta, cancel, want_audio
+            )
+            final_meta = summarize_probe(probe_file(out_path))
         log.info(
             "%s: loop source %s -> %.0fs clip",
             stream,
@@ -1346,8 +1505,10 @@ def source_clip_from_recordings(
             "tier": TIER_NAMES[win["tier"]],
         }
 
+    export_wins = wins
+    reasons = []
     if files:
-        win, reasons = _pick_window(
+        win, reasons, unavailable = _pick_window(
             api,
             camera,
             stream,
@@ -1360,29 +1521,81 @@ def source_clip_from_recordings(
             recordings_dir,
             check_drift=True,
         )
-        if win is None:
+        if win is not None:
+            tmp_clip = None
+            try:
+                tmp_clip = _fetch_window_via_files(
+                    recordings_dir,
+                    camera,
+                    stream,
+                    win,
+                    tmp_dir,
+                    cancel,
+                    progress,
+                    now,
+                    out_path=out_path,
+                    audio_policy=rcfg["audio"],
+                    want_audio=want_audio,
+                )
+                return finish(tmp_clip, win, audio_ready=True)
+            except Cancelled:
+                if tmp_clip and os.path.exists(tmp_clip):
+                    os.unlink(tmp_clip)
+                elif os.path.exists(out_path):
+                    os.unlink(out_path)
+                raise
+            except CaptureError as exc:
+                if tmp_clip and os.path.exists(tmp_clip):
+                    os.unlink(tmp_clip)
+                elif os.path.exists(out_path):
+                    os.unlink(out_path)
+                reasons.append(str(exc))
+                log.warning(
+                    "%s: direct loop assembly failed (%s) — trying Frigate " "export",
+                    stream,
+                    exc,
+                )
+                export_wins = [win] + [
+                    candidate for candidate in wins if candidate != win
+                ]
+            except BaseException:
+                if tmp_clip and os.path.exists(tmp_clip):
+                    os.unlink(tmp_clip)
+                elif os.path.exists(out_path):
+                    os.unlink(out_path)
+                raise
+        elif unavailable:
+            export_wins = unavailable
+            log.warning(
+                "%s: %d direct recording candidate(s) unavailable — trying "
+                "Frigate export",
+                stream,
+                len(unavailable),
+            )
+        else:
             raise CaptureError(
                 f"no lighting-stable loopable window — {len(wins)} candidate(s), "
                 f"all rejected ({_rejection_summary(reasons) or 'none'}); "
                 "per-candidate detail at DEBUG in the job log"
             )
-        tmp_clip = _fetch_window_via_files(
-            recordings_dir, camera, stream, win, tmp_dir, cancel, progress, now
-        )
-        try:
-            return finish(tmp_clip, win)
-        finally:
-            if os.path.exists(tmp_clip):
-                os.unlink(tmp_clip)
 
-    reasons = []
-    for win in wins[:MAX_EXPORT_CANDIDATES]:
+    export_wins = _exportable_windows(export_wins, now, reasons)
+    for win in export_wins[:MAX_EXPORT_CANDIDATES]:
         if cancel:
             cancel.check()
-        tmp_clip = _fetch_window_clip(
-            api, camera, stream, win, tmp_dir, cancel, progress, now, recordings_dir
-        )
+        tmp_clip = None
         try:
+            tmp_clip = _fetch_window_clip(
+                api,
+                camera,
+                stream,
+                win,
+                tmp_dir,
+                cancel,
+                progress,
+                now,
+                recordings_dir=None,
+            )
             reason = _lighting_ok(
                 tmp_clip, ref, rcfg, stream, win, now, cancel
             ) or _stable_across(
@@ -1406,9 +1619,10 @@ def source_clip_from_recordings(
             )
             reasons.append(str(exc))
         finally:
-            if os.path.exists(tmp_clip):
+            if tmp_clip and os.path.exists(tmp_clip):
                 os.unlink(tmp_clip)
     raise CaptureError(
-        f"no lighting-stable loopable window — {min(len(wins), MAX_EXPORT_CANDIDATES)}"
+        f"no lighting-stable loopable window — "
+        f"{min(len(export_wins), MAX_EXPORT_CANDIDATES)}"
         f" export candidate(s) rejected ({_rejection_summary(reasons) or 'none'})"
     )

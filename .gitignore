@@ -15,8 +15,9 @@
 !/compose.example.yaml
 !/config.example.yaml
 !/requirements.txt
-!/up.sh
 !/app/
+!/tests/
+!/.gitattributes
 
 # ...but never Python caches, even inside allowed directories:
 __pycache__/

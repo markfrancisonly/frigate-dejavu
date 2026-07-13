@@ -1,18 +1,17 @@
 """Frigate + go2rtc HTTP clients, and Frigate raw-config YAML surgery.
 
 All config edits are ruamel.yaml round-trips (comments, anchors, `{FRIGATE_*}`
-placeholders preserved). Only `go2rtc.streams.<name>` values are ever touched
+placeholders preserved). Only selected `go2rtc.streams.<name>` values and Déjà
+Vu's namespaced `go2rtc.ffmpeg.frigate_dejavu_loop` support template are touched
 (SPEC §4).
 """
 
 import copy
 import fnmatch
-import http.client
 import io
 import json
 import logging
 import re
-import socket
 
 import requests
 from ruamel.yaml import YAML
@@ -117,26 +116,8 @@ def http_post(url, **kw):
     return _request("POST", url, **kw)
 
 
-def http_patch(url, **kw):
-    return _request("PATCH", url, **kw)
-
-
 def http_delete(url, **kw):
     return _request("DELETE", url, **kw)
-
-
-class _UnixHTTPConnection(http.client.HTTPConnection):
-    """Minimal HTTP-over-unix-socket connection (docker restart fallback)."""
-
-    def __init__(self, path, timeout):
-        super().__init__("localhost", timeout=timeout)
-        self._unix_path = path
-
-    def connect(self):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
-        sock.connect(self._unix_path)
-        self.sock = sock
 
 
 class FrigateClient:
@@ -144,8 +125,6 @@ class FrigateClient:
         f = cfg["frigate"]
         self.api = f["api_url"].rstrip("/")
         self.go2rtc = f["go2rtc_api_url"].rstrip("/")
-        self.container = f["container_name"]
-        self.docker_socket = "/var/run/docker.sock"
 
     # -- Frigate API --------------------------------------------------------
 
@@ -208,39 +187,6 @@ class FrigateClient:
                 "restart request dropped (frigate likely already restarting): %s", exc
             )
 
-    def processed_config(self):
-        """Frigate's RUNNING config as JSON — {FRIGATE_*} placeholders already
-        resolved. Reflects what Frigate loaded at its last (re)start, NOT
-        unrestarted saveonly edits — which is exactly what a runtime
-        PATCH-back needs."""
-        try:
-            r = http_get(f"{self.api}/api/config", timeout=15)
-        except requests.RequestException as exc:
-            raise FrigateError(f"GET /api/config failed: {exc}") from exc
-        if r.status_code != 200:
-            raise FrigateError(f"GET /api/config failed: HTTP {r.status_code}")
-        try:
-            return r.json()
-        except ValueError as exc:
-            raise FrigateError(f"GET /api/config returned non-JSON: {exc}") from exc
-
-    def patch_stream(self, name, src):
-        """Runtime go2rtc source swap for ONE stream — existing consumers are
-        kicked (they reconnect within seconds), nothing else is touched, and
-        nothing persists (persistence is ours via config/save saveonly)."""
-        try:
-            r = http_patch(
-                f"{self.go2rtc}/api/streams",
-                params={"name": name, "src": src},
-                timeout=10,
-            )
-        except requests.RequestException as exc:
-            raise FrigateError(f"go2rtc PATCH {name} failed: {exc}") from exc
-        if r.status_code != 200:
-            raise FrigateError(
-                f"go2rtc PATCH {name} failed: HTTP {r.status_code}: " f"{r.text[:150]}"
-            )
-
     def version(self):
         try:
             r = http_get(f"{self.api}/api/version", timeout=4)
@@ -276,67 +222,6 @@ class FrigateClient:
         except FrigateError:
             return False
 
-    def _docker_request(self, method, path, body=None, timeout=30):
-        conn = _UnixHTTPConnection(self.docker_socket, timeout=timeout)
-        try:
-            payload = json.dumps(body) if body is not None else None
-            conn.request(
-                method,
-                path,
-                body=payload,
-                headers={"Content-Type": "application/json", "Host": "docker"},
-            )
-            resp = conn.getresponse()
-            raw = resp.read()
-        except OSError as exc:
-            raise FrigateError(f"docker API {path} failed: {exc}") from exc
-        finally:
-            conn.close()
-        return resp.status, raw
-
-    def docker_exec(self, cmd, timeout=30):
-        """Run a command inside the frigate container via the docker socket.
-        Raises on non-zero exit."""
-        status, raw = self._docker_request(
-            "POST",
-            f"/containers/{self.container}/exec",
-            {"AttachStdout": True, "AttachStderr": True, "Cmd": cmd},
-            timeout,
-        )
-        if status != 201:
-            raise FrigateError(f"docker exec create failed: HTTP {status}: {raw[:150]}")
-        exec_id = json.loads(raw)["Id"]
-        status, _ = self._docker_request(
-            "POST", f"/exec/{exec_id}/start", {"Detach": False, "Tty": False}, timeout
-        )
-        if status != 200:
-            raise FrigateError(f"docker exec start failed: HTTP {status}")
-        status, raw = self._docker_request(
-            "GET", f"/exec/{exec_id}/json", None, timeout
-        )
-        code = json.loads(raw).get("ExitCode")
-        if code != 0:
-            raise FrigateError(f"docker exec {' '.join(cmd)} exited {code}")
-
-    def go2rtc_restart(self):
-        """Restart ONLY the embedded go2rtc SERVICE (s6 kick, not go2rtc's
-        /api/restart — that self-re-execs and rereads the STALE generated
-        config). The s6 run script re-runs create_config, regenerating
-        /dev/shm/go2rtc.yaml from config.yml — picking up our saveonly edits.
-        Frigate's detection/recording machinery never restarts; its ffmpeg
-        consumers drop once and reconnect within seconds."""
-        self.docker_exec(["/command/s6-svc", "-t", "/run/service/go2rtc"])
-
-    def wait_go2rtc_up(self, timeout=45):
-        import time
-
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.go2rtc_up():
-                return True
-            time.sleep(2)
-        return False
-
     # -- restart/health orchestration ---------------------------------------
 
     def wait_down(self, timeout=30):
@@ -365,33 +250,6 @@ class FrigateClient:
                 consecutive = 0
             time.sleep(2)
         return False
-
-    def docker_restart(self, stop_timeout=30):
-        """Fallback: POST /containers/<name>/restart over the docker socket."""
-        log.info(
-            "docker restart fallback: restarting container %r (t=%ss)",
-            self.container,
-            stop_timeout,
-        )
-        conn = _UnixHTTPConnection(self.docker_socket, timeout=stop_timeout + 90)
-        try:
-            conn.request(
-                "POST",
-                f"/containers/{self.container}/restart?t={stop_timeout}",
-                headers={"Host": "docker"},
-            )
-            resp = conn.getresponse()
-            body = resp.read().decode(errors="replace")
-        except OSError as exc:
-            raise FrigateError(
-                f"docker restart via {self.docker_socket} failed: {exc}"
-            ) from exc
-        finally:
-            conn.close()
-        if resp.status not in (200, 204):
-            raise FrigateError(
-                f"docker restart failed: HTTP {resp.status}: {body[:300]}"
-            )
 
 
 # --------------------------------------------------------------------------
@@ -543,6 +401,20 @@ def resolve_streams(data, cfg, camera_patterns):
     return filtered, notes
 
 
+def resolution_blockers(notes):
+    """Return targeted-camera problems that make partial privacy unsafe."""
+    blockers = []
+    if notes["unsupported_cameras"]:
+        blockers.append(
+            "unsupported cameras: " + ", ".join(notes["unsupported_cameras"])
+        )
+    if notes["missing_streams"]:
+        blockers.append(
+            "missing go2rtc streams: " + ", ".join(notes["missing_streams"])
+        )
+    return blockers
+
+
 def audio_extras(sources):
     """Ordered #audio= transcode offers from the original source lines that
     '#audio=copy' of an AAC capture does not already provide (SPEC §4.2)."""
@@ -568,33 +440,22 @@ def build_dejavu_source(clips_frigate_dir, stream, has_audio, extras):
 
 def apply_dejavu(data, replacements):
     """Replace each stream's whole source list with the single dejavu source
-    and install the (permanent) loop input template. Returns a record of any
-    pre-existing template value so restore can put it back."""
+    and ensure the persistent loop input template is installed."""
     streams = go2rtc_streams_map(data)
-    ffmpeg_map = (
-        data["go2rtc"].get("ffmpeg")
-        if isinstance(data["go2rtc"].get("ffmpeg"), (dict, CommentedMap))
-        else None
-    )
-    prior = None
-    if (
-        ffmpeg_map
-        and DEJAVU_TEMPLATE_NAME in ffmpeg_map
-        and str(ffmpeg_map[DEJAVU_TEMPLATE_NAME]) != DEJAVU_TEMPLATE_ARGS
-    ):
-        prior = str(ffmpeg_map[DEJAVU_TEMPLATE_NAME])
     ensure_loop_template(data)
-    template_rec = {"name": DEJAVU_TEMPLATE_NAME, "prior": prior}
 
     for stream, src in replacements.items():
         streams[stream] = CommentedSeq([DoubleQuotedScalarString(src)])
-    return template_rec
 
 
 def ensure_loop_template(data):
-    """Make sure go2rtc.ffmpeg carries the loop template. It is PERMANENT:
-    the running go2rtc must always have it loaded so runtime PATCH swaps can
-    reference it without a restart. Returns True if the config changed."""
+    """Install Déjà Vu's persistent go2rtc loop template if it is absent.
+
+    The namespaced key is part of the appliance's standing configuration and
+    remains unused while privacy is off. A different value under that reserved
+    key is a configuration conflict; never overwrite it silently.
+    Returns True if the config changed.
+    """
     go2rtc = data.get("go2rtc")
     if not isinstance(go2rtc, (dict, CommentedMap)):
         raise FrigateError("Frigate config has no go2rtc section")
@@ -602,47 +463,22 @@ def ensure_loop_template(data):
     if not isinstance(ffmpeg_map, (dict, CommentedMap)):
         ffmpeg_map = CommentedMap()
         go2rtc["ffmpeg"] = ffmpeg_map
-    if str(ffmpeg_map.get(DEJAVU_TEMPLATE_NAME, "")) == DEJAVU_TEMPLATE_ARGS:
-        return False
+    if DEJAVU_TEMPLATE_NAME in ffmpeg_map:
+        if str(ffmpeg_map[DEJAVU_TEMPLATE_NAME]) == DEJAVU_TEMPLATE_ARGS:
+            return False
+        raise FrigateError(
+            f"go2rtc.ffmpeg.{DEJAVU_TEMPLATE_NAME} is reserved by Déjà Vu "
+            "and has a conflicting value"
+        )
     ffmpeg_map[DEJAVU_TEMPLATE_NAME] = DEJAVU_TEMPLATE_ARGS
     return True
 
 
-def template_in_config(data):
-    try:
-        ffmpeg_map = (data.get("go2rtc") or {}).get("ffmpeg") or {}
-        return str(ffmpeg_map.get(DEJAVU_TEMPLATE_NAME, "")) == DEJAVU_TEMPLATE_ARGS
-    except AttributeError:
-        return False
-
-
-def _restore_template(current_data, template_rec):
-    """The loop template is permanent — restore only ever puts back a
-    pre-existing DIFFERENT value the user had under our key (improbable).
-    Returns True if changed."""
-    if not template_rec:
-        return False
-    prior = template_rec.get("prior")
-    if prior is None or prior == DEJAVU_TEMPLATE_ARGS:
-        return False
-    go2rtc = current_data.get("go2rtc")
-    if not isinstance(go2rtc, (dict, CommentedMap)):
-        return False
-    ffmpeg_map = go2rtc.get("ffmpeg")
-    name = template_rec.get("name") or DEJAVU_TEMPLATE_NAME
-    if not isinstance(ffmpeg_map, (dict, CommentedMap)) or name not in ffmpeg_map:
-        return False
-    if str(ffmpeg_map[name]) == prior:
-        return False
-    ffmpeg_map[name] = prior
-    return True
-
-
-def graft_restore(current_data, backup_data, records, template_rec=None):
+def graft_restore(current_data, backup_data, records):
     """Surgically restore original sources into the CURRENT config by
     transplanting the pristine nodes from the backup document (comments and
-    scalar formatting ride along), then remove the loop template we installed.
-    `records` is streams.json's per-stream dict.
+    scalar formatting ride along). The persistent loop template is intentionally
+    retained. `records` is streams.json's per-stream dict.
 
     Returns (changed, restored, drifted, missing)."""
     cur = go2rtc_streams_map(current_data)
@@ -675,8 +511,6 @@ def graft_restore(current_data, backup_data, records, template_rec=None):
         restored.append(stream)
         changed = True
 
-    if _restore_template(current_data, template_rec):
-        changed = True
     return changed, restored, drifted, missing
 
 

@@ -21,10 +21,6 @@ DEFAULTS = {
         "api_url": "http://frigate:5000",
         "go2rtc_api_url": "http://frigate:1984",
         "restream_url": "rtsp://frigate:8554",
-        "container_name": "frigate",
-        "restart_method": "api",
-        "restart_fallback": True,
-        "swap_method": "go2rtc",
         "health_timeout_seconds": 300,
         "settle_timeout_seconds": 240,
         # Optional credentials for Frigate's AUTHENTICATED API port (8971).
@@ -52,7 +48,6 @@ DEFAULTS = {
         "rtsp_query": "mp4",
         "parallel": 4,
         "parallel_frames": 8,
-        "engage_deadline_seconds": 15,
         "keep_clips_after_off": False,
         "recordings": {
             "search_hours": 4,
@@ -75,7 +70,7 @@ DEFAULTS = {
         "exclude": [],
     },
     "profiles": {
-        "default": {"mode": "freeze", "cameras": []},
+        "default": {"mode": "loop", "cameras": []},
     },
     "api": {
         "listen": "0.0.0.0:8898",
@@ -125,27 +120,12 @@ def _str_list(value, path):
 
 def validate(cfg):
     f = cfg["frigate"]
-    for key in ("api_url", "go2rtc_api_url", "restream_url", "container_name"):
+    for key in ("api_url", "go2rtc_api_url", "restream_url"):
         _require(
             isinstance(f.get(key), str) and f[key],
             f"frigate.{key}",
             "must be a non-empty string",
         )
-    _require(
-        f.get("restart_method") in ("api", "docker"),
-        "frigate.restart_method",
-        "must be 'api' or 'docker'",
-    )
-    _require(
-        f.get("swap_method") in ("go2rtc", "restart", "patch"),
-        "frigate.swap_method",
-        "must be 'go2rtc' (service-only reload) or 'restart' (full frigate)",
-    )
-    _require(
-        isinstance(f.get("restart_fallback"), bool),
-        "frigate.restart_fallback",
-        "must be a boolean",
-    )
     _pos_int(cfg, "frigate.health_timeout_seconds")
     _pos_int(cfg, "frigate.settle_timeout_seconds")
 
@@ -182,7 +162,6 @@ def validate(cfg):
     _pos_int(cfg, "capture.freeze_clip_seconds")
     _pos_int(cfg, "capture.parallel")
     _pos_int(cfg, "capture.parallel_frames")
-    _pos_int(cfg, "capture.engage_deadline_seconds")
     _require(
         cap["max_loop_seconds"] >= cap["seconds"],
         "capture.max_loop_seconds",
@@ -241,7 +220,7 @@ def validate(cfg):
     )
     _str_list(dil.get("block_labels", []), "capture.recordings.dilute.block_labels")
     _require(
-        "person" in [l.lower() for l in dil.get("block_labels", [])],
+        "person" in [label.lower() for label in dil.get("block_labels", [])],
         "capture.recordings.dilute.block_labels",
         "must include 'person' — replaying a person is a disclosure, not a loop tell",
     )
@@ -276,8 +255,12 @@ def validate(cfg):
     )
     _require("default" in profiles, "profiles", "must define a 'default' profile")
     for name, prof in profiles.items():
-        prof = prof or {}
+        prof = {} if prof is None else prof
         _require(isinstance(prof, dict), f"profiles.{name}", "must be a mapping")
+        unknown = sorted(set(prof) - {"mode", "cameras", "capture_seconds", "source"})
+        _require(
+            not unknown, f"profiles.{name}", "unknown key(s): " + ", ".join(unknown)
+        )
         mode = prof.get("mode", "freeze")
         _require(
             mode in ("loop", "freeze"),
@@ -288,6 +271,7 @@ def validate(cfg):
         if "capture_seconds" in prof:
             _require(
                 isinstance(prof["capture_seconds"], int)
+                and not isinstance(prof["capture_seconds"], bool)
                 and prof["capture_seconds"] >= 1,
                 f"profiles.{name}.capture_seconds",
                 "must be an integer >= 1",
@@ -344,7 +328,7 @@ def load_config(path=None):
     if isinstance(user.get("profiles"), dict) and user["profiles"]:
         profiles = {}
         for name, prof in user["profiles"].items():
-            profiles[name] = copy.deepcopy(prof) if prof else {}
+            profiles[name] = copy.deepcopy(prof) if prof is not None else {}
         if "default" not in profiles:
             profiles["default"] = copy.deepcopy(DEFAULTS["profiles"]["default"])
         cfg["profiles"] = profiles

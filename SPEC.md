@@ -6,9 +6,10 @@ go2rtc layer, so Frigate and every downstream consumer keep running unaware
 while the cameras are effectively "off". This document is the contract for the
 implementation.
 
-Security and cybersecurity considerations are explicitly OUT OF SCOPE (owner's
-call): the bearer token is a convenience latch, not a security boundary, and
-the API is assumed to live on a trusted network.
+The bearer token is the appliance's application-layer access control, not a
+replacement for network segmentation or TLS. The example deployment binds the
+host port to loopback; operators must configure a token or authenticated reverse
+proxy before exposing the API to a LAN or wider network.
 
 ---
 
@@ -29,11 +30,16 @@ never touched.
 
 Sequence, in one line:
 
-    capture N seconds of each stream → write clips → edit go2rtc.streams in
-    Frigate config (via Frigate REST API) → restart Frigate → looped playback
-    ("privacy on") … → restore original stream sources → restart → live again.
+    prepare freeze fallbacks + search recordings → finalize clips → edit
+    go2rtc.streams through Frigate's REST API → restart Frigate → privacy on …
+    → restore original stream sources → restart → live again.
 
-## 2. Verified environment (2026-07-07)
+## 2. Production reference architecture (verified 2026-07-07)
+
+This is the deployed, proven architecture and the baseline for the tracked
+examples—not incidental test context. Other installations may change addresses,
+mounts, camera brands, or authentication, but departures from the media topology
+and restart model below must be treated as architecture changes and revalidated.
 
 | Fact | Value |
 |---|---|
@@ -88,10 +94,12 @@ selected camera the appliance parses the Frigate config (fetched live from
 these, deduplicated, filtered through the global `streams.include` /
 `streams.exclude` globs, is the replacement set.
 
-- A camera with no restream-style input is reported as `unsupported` in the
-  job result and skipped (none exist in this deployment today).
-- `camera.birdseye` (frigate-generated composite) and the tablet/wallpanel
-  feeds are excluded by default via config, not code.
+- A camera with no restream-style input is reported as `unsupported` and the
+  whole activation is refused before Frigate's config is touched. Partial
+  privacy must never be reported as on.
+- `camera.birdseye` (a Frigate-generated composite) is excluded by default via
+  config, not code. Tablet/wallpanel feeds remain included unless the operator
+  explicitly excludes them.
 
 ### 4.2 The swap
 
@@ -101,15 +109,20 @@ Frigate's config is replaced with a single source:
 ```yaml
 go2rtc:
   ffmpeg:
-    frigate_dejavu_loop: -re -stream_loop -1 -i {input}   # installed with the swap, removed on restore
+    frigate_dejavu_loop: -re -stream_loop -1 -i {input}   # persistent; unused while privacy is off
   streams:
     camera.kitchen:
       - "ffmpeg:/config/dejavu-clips/camera.kitchen.dejavu.mp4#input=frigate_dejavu_loop#video=copy#audio=copy#audio=opus#audio=pcmu"
 ```
 
-- `#input=frigate_dejavu_loop` selects a named go2rtc input template the
-  appliance installs alongside the swap: ffmpeg reads the file at native
-  speed and loops it forever. Each loop restarts at the file's leading IDR
+- `#input=frigate_dejavu_loop` selects a named go2rtc input template. The
+  appliance installs this namespaced support entry on first activation and
+  retains it across normal OFF transitions; it has no media-path effect until a
+  selected stream references it. A whole-file `force-restore` may remove it with
+  the pristine backup, and the next activation reinstalls it. A different value
+  under the reserved key is refused, not overwritten. ffmpeg reads the file at
+  native speed and loops it forever.
+  Each loop restarts at the file's leading IDR
   frame, so consumers resync within one frame at the loop point.
   (A raw inline `#input=… {input}` is NOT usable here — Frigate's go2rtc
   config generator `str.format()`s stream source values and crash-loops
@@ -126,7 +139,8 @@ go2rtc:
 
 Everything else in the config — the `cameras:` tree, secrets placeholders,
 comments, anchors — is preserved: the edit is a ruamel.yaml round-trip that
-touches only the replaced `go2rtc.streams.<S>` values.
+touches only the replaced `go2rtc.streams.<S>` values and ensures the one
+namespaced persistent template above.
 
 ### 4.3 Why consumers don't notice
 
@@ -140,7 +154,7 @@ touches only the replaced `go2rtc.streams.<S>` values.
 
 ## 5. Capture primitives
 
-The building blocks the two-phase engage (§5c) composes. All ffmpeg; all
+The building blocks the pre-activation preparation (§5c) composes. All ffmpeg; all
 cancellable; all run **before** any config is modified, so cancellation during
 capture leaves zero footprint.
 
@@ -169,14 +183,13 @@ profile/level may differ from the camera's — acceptable, consumers negotiate
 via SDP. Loop-point timestamp reset produces a known, harmless ffmpeg DTS
 warning in go2rtc logs.
 
-## 5b. Loop sourcing from recordings (the loop upgrade)
+## 5b. Loop sourcing from recordings (pre-activation search)
 
-Live capture loops whatever happens right after the toggle — a passing car
-re-appearing every 60 s, or a person frozen mid-stride — so loops are sourced
-from Frigate's own recordings, which are codec-identical (same `?mp4`
-restream) and already carry Frigate's object/event metadata. This is the
-**upgrade** half of §5c; the freeze frame is already serving before any of it
-runs.
+Live capture loops whatever happens during capture — a passing car re-appearing
+every 60 s, or a person frozen mid-stride — so the production default sources
+loops from Frigate's own recordings, which are codec-identical (same `?mp4`
+restream) and already carry Frigate's object/event metadata. The search and
+atomic clip promotion finish before any Frigate config change or restart.
 
 The single most important principle (owner directive): **the tell is
 repetition, not the presence of a transient.** A 20-minute window in which a
@@ -202,16 +215,19 @@ Per stream, parallelized (`capture.parallel`):
    - **short-quiet** — a fully-quiet run shorter than target but
      ≥ `recordings.min_seconds`. Last resort before the freeze frame stands.
 
-   Ranking: hour-age bucket first (the proxy for the current lighting regime,
-   so the guards reject fewer candidates), then tier, then LONGEST, then least
-   motion, then most recent. Length tests tolerate ±0.5 s of segment jitter
+   Ranking: tier first, then hour-age bucket, LONGEST, least motion, most recent.
+   A full quiet/diluted loop is preferable to an obvious 20–30 s repetition;
+   the lighting guards authoritatively reject stale day/night matches. A diluted
+   start backs down from an overactive long tail to the longest endpoint that
+   satisfies the activity limit. Length tests tolerate ±0.5 s of segment jitter
    (a 20 s run of two nominal-10 s segments measures 19.99 s).
 1b. **Cross-camera sync** (`recordings.sync_tolerance_minutes`, default 10;
    0 disables): overlapping views loop the SAME moment. A pre-pass picks the
-   most recent anchor on Frigate's server timeline covered by the most cameras;
-   each camera's candidates are tried anchor-first. (Freeze frames need no
-   sync — every camera freezes on a frame of *now*, the same instant by
-   construction.)
+   newest-hour anchor on Frigate's server timeline with the most full-window
+   coverage, then total coverage. Synced full candidates are tried first, but an
+   unsynced full loop still outranks a synchronized short fallback. (Freeze
+   frames need no sync — every camera freezes on a frame of *now*, the same
+   instant by construction.)
 2. **Segment settle** — a fresh window's newest segment is read only once its
    file size is stable across a re-stat (`_segment_settled`); older windows
    skip the check. This *directly* tests "Frigate finished writing this," which
@@ -232,50 +248,56 @@ Per stream, parallelized (`capture.parallel`):
    - *brightness*: hotspot-trimmed luma delta vs reference > `max_brightness_delta`
      (default 60) rejects; loop windows also reject on first-to-last drift
      > `max_brightness_drift` (default 20, dawn/dusk pulse). The last segment
-     (nearest now) is probed first, so a stale-lighting candidate costs one
-     probe, not two.
-4. **Stitch** the winner from its segment files (`-f concat -c copy`; export
-   API is the automatic fallback where the recordings mount is absent — still
-   strictly serialized, since Frigate's export worker wedges under concurrent
-   jobs), then apply the **audio policy** (`recordings.audio`, default
-   `silence`: same-rate/channel silent AAC — repeating audio is the most
-   obvious tell). The clip's audio presence is pinned to match the freeze frame
-   it replaces, so the already-published go2rtc source string still fits.
+   (nearest now) is probed first, so a stale-lighting candidate costs one
+   probe, not two. Up to three survivors in the same recency/tier group are
+   ranked by mean 16×16 endpoint luma difference to minimize the visible seam.
+4. **Stitch** the winner from its segment files (`-f concat -c copy`). The
+   Frigate export API is the automatic per-candidate fallback when the mount is
+   absent, a candidate's segment files are missing/unreadable, or direct
+   assembly fails. One failed export advances to the next ranked candidate;
+   fallback retains the export path's 30-second freshness margin, skipping a
+   newer direct-read candidate rather than risking a wedged export worker.
+   Exported candidates still pass the same lighting, IR, drift, duration, and
+   audio checks. Exports remain strictly serialized because Frigate's export
+   worker wedges under concurrent jobs. Direct-file assembly applies the
+   **audio policy in the same ffmpeg
+   pass** (`recordings.audio`, default `silence`: same-rate/channel silent AAC —
+   repeating audio is the most obvious tell). The clip's audio presence is
+   pinned to match the prepared freeze fallback, so either finalized clip fits
+   the same planned go2rtc source string at activation.
 
-## 5c. Two-phase engage: instant freeze, background loop upgrade
+## 5c. Pre-activation preparation: freeze fallback, then loop search
 
-Privacy must engage the instant the switch is thrown; it must never wait on,
-or be defeated by, a slow window search. And a stream is **never left live** —
-that is the whole point of the appliance. Both follow from one structure:
-
-**Phase 1 — engage.** Every stream gets a freeze clip via the ladder, and the
-config swap makes privacy live:
+A stream is **never left live after activation**. Before Frigate's config is
+changed, every stream gets a freeze clip via the ladder:
 
 | rung | source | when |
 |---|---|---|
 | 1 live | one frame of NOW (lighting-correct by construction; also the guard reference) | normal |
 | 2 recorded | newest lighting-matched event-clear recorded frame | camera offline now |
-| 3 cached | the last frame this camera ever froze on (kept under `state/lastframe/`) | offline a while |
+| 3 cached | the last frame this camera ever froze on, with atomic media-metadata sidecar (kept under `state/lastframe/`) | offline a while |
 | 4 black | synthesized placeholder | nothing exists anywhere — loudly logged |
 
-There is no "skip" and no whole-job "abort" for an uncooperative camera: the
-ladder bottoms out in a synthesized frame, which still provides privacy. `abort`
-is reserved for infrastructure failure (config write rejected, go2rtc won't
-reload) — the "died trying, see the logs" last word.
+There is no "skip" for an uncooperative camera: the ladder bottoms out in a
+synthesized frame, which still provides privacy. The whole job is refused only
+when a requested stream cannot be resolved, the ladder violates that invariant,
+or infrastructure fails; partial privacy is never reported as on.
 
-**Phase 2 — upgrade** (loop mode only): a background search per stream (§5b)
-looks for a loopable window and, when found, replaces the freeze clip **in
-place** — same clip path, so the go2rtc source string is unchanged and the swap
-is a clip promote (atomic `os.replace`) plus one reload, not a config edit. If
-the search beats `capture.engage_deadline_seconds` (default 15 s) it folds into
-the first swap and privacy engages already-looped (one reload); otherwise
-privacy engages on freeze frames and each stream upgrades as its window lands.
-Every failure in phase 2 leaves the freeze frame serving — privacy is intact
-throughout.
+In loop mode, parallel searches then look for loopable windows (§5b). Each
+successful result replaces its freeze clip with a same-directory atomic
+`os.replace`; every failed search leaves its freeze intact. Only after all
+searches complete does the appliance persist the finalized source set and
+perform one coordinated Frigate restart. This avoids mutating live go2rtc state
+or replacing an open clip while consumers are running.
 
-Net: time-to-private is ~one live frame + one go2rtc reload (seconds), not
-capture-period + restart, and the failure floor moved from "stream stays LIVE"
-to "stream shows a still frame."
+The tradeoff is explicit: activation waits for loop preparation and the Frigate
+restart. The safety floor remains "stream shows a still frame," never "stream
+stays live after the appliance reports on."
+
+`source: restream` with loop mode is an explicit, non-reference exception: it
+captures the requested live interval directly, without the recordings metadata
+or lighting guards and without preparing a freeze fallback. A failed restream
+capture refuses the whole activation before Frigate's config is touched.
 
 ## 6. Switch-on sequence
 
@@ -283,28 +305,27 @@ to "stream shows a still frame."
 2. State → `capturing` (cancellable). Fetch `/api/config/raw`; store pristine
    backup `state/backup.<ts>.yaml` + `state/backup.current.yaml`.
 3. Resolve profile → cameras → streams (§4.1). Empty set → error, state `off`.
-4. **Phase 1 — engage** (§5c): a freeze clip per stream via the ladder,
-   bounded by `capture.parallel_frames`. Every stream yields a clip; the only
-   failures here are bugs or cancellation. Cancellation (an `off`/`cancel`
-   arriving now) kills the ffmpeg process group, deletes partial clips,
-   state → `off`.
-5. **Phase 2 kickoff** (loop mode): background loop searches start here (§5b),
-   so their `engage_deadline_seconds` overlaps the config write and swap below.
-6. State → `applying` (no longer cancellable). Edit go2rtc.streams (§4.2);
-   record per-stream original sources in `state/streams.json`. If the loop
-   search beat the deadline, its clips are already promoted so this engages
-   already-looped.
+4. Prepare a freeze clip per stream via the ladder (§5c), except for the
+   explicit `source: restream` loop path, which captures its live loop directly,
+   bounded by `capture.parallel_frames`. The freeze ladder always yields a clip;
+   a failed direct restream capture refuses activation. Cancellation (an
+   `off`/`cancel` arriving now) kills the ffmpeg process group, deletes partial
+   clips, state → `off`.
+5. In loop mode, run per-stream searches in parallel (§5b), wait for all
+   searches, and atomically promote successful clips. Failed searches retain
+   their freeze fallbacks. State remains `capturing`, so `off` can cancel this
+   work while Frigate is still untouched.
+6. State → `applying` (no longer cancellable). Re-fetch the raw config to
+   preserve edits made during preparation. Edit `go2rtc.streams` (§4.2) and
+   record per-stream original sources in `state/streams.json`.
 7. `POST /api/config/save?save_option=saveonly` (body = edited raw YAML).
    Frigate validates server-side; on rejection → nothing was saved → state
    `off`, error surfaced, clips kept for inspection.
-8. Swap via go2rtc service reload (§4.2 / §8) and wait healthy.
+8. Apply through one coordinated Frigate restart (§8) and wait healthy.
 9. **Verify**: go2rtc `/api/streams` shows each replaced stream's source is
    the privacy clip. All verified → state `on`. Any stream still live →
    automatic rollback (restore sources, restart again), state `error` with
    detail.
-10. **Phase 2 finish**: await stragglers, promote their loop clips in place,
-    one more go2rtc reload. Privacy is already `on` throughout; any failure
-    here leaves the freeze frames serving.
 
 ## 7. Switch-off sequence
 
@@ -317,25 +338,23 @@ to "stream shows a still frame."
    with the original and the drifted version is saved to `state/drift.<ts>.
    yaml` (warned in status + logs). Whole-file backup remains as disaster
    fallback (`dejavu force-restore` writes `backup.current.yaml` verbatim).
-3. Save (`saveonly`) → restart → wait healthy → verify original sources are
-   live again → state `off`.
+3. Save (`saveonly`) → coordinated Frigate restart → wait for the Frigate API
+   and go2rtc → verify the privacy sources were removed → state `off`.
 4. Clips deleted unless `capture.keep_clips_after_off: true`. State artifacts
    (backups, drift copies) are retained.
 
 ## 8. Restart & verification strategy
 
-- Primary: `POST /api/restart` (documented; Frigate exits its container and
-  the `restart: always` policy recreates the process tree, which regenerates
-  the embedded go2rtc config from `config.yml`).
-- Health wait: poll `GET /api/version` until 200, then go2rtc `/api/streams`
-  reachable, up to `frigate.health_timeout_seconds` (default 120 s).
-- If post-restart verification (§6.8) shows go2rtc did NOT pick up the new
-  sources (e.g. an internal-only service restart that skipped go2rtc) and
-  `frigate.restart_fallback: true`, the appliance falls back to
-  `docker restart frigate` via the mounted Docker socket, then re-verifies.
-  `frigate.restart_method: docker` forces the fallback path always.
-- Each privacy session costs exactly two Frigate restarts (on + off); the
-  recording gap (~10–30 s each) is inherent and accepted.
+- Engage and restore always use a coordinated full Frigate restart. This
+  rebuilds go2rtc and Frigate's camera consumers in order and avoids reporting
+  success while camera processes remain stranded after producer replacement.
+- Verify go2rtc `/api/streams` references every expected privacy clip (or no
+  longer references one during restore).
+- Restarts use Frigate's `POST /api/restart`. The appliance has no Docker API
+  access and does not mount the Docker socket. If Frigate's API cannot recover,
+  the transition reports `error` and an operator restarts Frigate externally.
+- Normal sessions require one coordinated Frigate restart on engage and one on
+  restore. There is no configurable or live-swap path.
 
 ## 9. State machine, locking, debounce, cancellation
 
@@ -356,8 +375,9 @@ States (persisted in `state/state.json`, updated under an `fcntl` flock on
 - **Busy rules**: duplicate direction while a job runs → 409/2. `off` during
   `capturing` → cooperative cancel (SIGTERM to the job's process group; job
   cleans up partial clips and exits to `off`). `on` during `restoring` → 409
-  (restore always runs to completion). `off` during `applying` → 409 (window
-  is a few seconds; issue `off` again once `on`).
+  (restore always runs to completion). `off` during `applying` → 409 (the
+  save/restart/verify operation runs to completion; issue `off` again once
+  `on`).
 - Appliance restart while privacy `on` is safe: state and backups are on
   disk; Frigate keeps looping clips (config + clips persist) until `off`.
 
@@ -366,7 +386,8 @@ States (persisted in `state/state.json`, updated under an `fcntl` flock on
 ### 10.1 CLI (`dejavu`, inside the container)
 
     dejavu on   [--profile NAME] [--mode loop|freeze] [--cameras a,b,…]
-                    [--capture-seconds N]      # blocking; progress on stdout
+                    [--capture-seconds N] [--source recordings|restream]
+                                              # blocking; progress on stdout
     dejavu off                             # blocking; cancels capture if running
     dejavu cancel                          # alias of off during capture
     dejavu status [--json]
@@ -376,18 +397,25 @@ States (persisted in `state/state.json`, updated under an `fcntl` flock on
     docker exec frigate-dejavu dejavu on --profile indoor --mode freeze
 
 Exit codes: `0` ok · `1` failure · `2` busy/debounced · `3` invalid request.
-`--mode`/`--cameras`/`--capture-seconds` override the chosen profile's values
-(`--profile` defaults to `default`).
+`--mode`/`--cameras`/`--capture-seconds`/`--source` override the chosen profile's
+values (`--profile` defaults to `default`). An omitted profile mode resolves to
+the safe `freeze` behavior; the tracked default profile explicitly selects
+`loop`.
 
 ### 10.2 REST API
 
 | Method & path | Body / params | Behavior |
 |---|---|---|
-| `POST /api/dejavu/on` | `{"profile"?, "mode"?, "cameras"?, "capture_seconds"?}` | Spawns detached `dejavu on …`; returns **202** + state snapshot. 409 busy/debounce, 400 invalid. |
+| `POST /api/dejavu/on` | `{"profile"?, "mode"?, "cameras"?, "capture_seconds"?, "source"?}` | Spawns detached `dejavu on …`; returns **202** + state snapshot. `source` is `recordings` or `restream`; 409 busy/debounce, 400 invalid. |
 | `POST /api/dejavu/off` | – | Spawns `dejavu off` (cancels capture if capturing); **202**. |
-| `GET /api/dejavu/status` | – | **200** state JSON: `state, profile, mode, since, streams{name: phase/result}, last_error, drift_detected, frigate{reachable, version}`. |
+| `GET /api/dejavu/status` | – | **200** state JSON: `state, profile, mode, since, session, capture_seconds, streams{name: phase/result}, last_error, note, drift_detected, frigate{reachable, version, go2rtc}`. `frigate` is omitted from non-live internal snapshots. |
 | `GET /api/dejavu/profiles` | – | Profiles as resolved from config. |
 | `GET /healthz` | – | Liveness (no auth). |
+
+For `POST /api/dejavu/on`, an empty body selects the default profile and
+`"cameras": []` explicitly selects all Frigate cameras. Unknown fields,
+malformed/non-object JSON, blank camera names, and invalid field types return
+`400`.
 
 Auth: iff a bearer token is configured (`DEJAVU_API_TOKEN` env, or
 `api.bearer_token`), every `/api/*` request must send
@@ -436,10 +464,7 @@ frigate:
   api_url: http://frigate:5000        # Frigate internal (unauthenticated) API
   go2rtc_api_url: http://frigate:1984
   restream_url: rtsp://frigate:8554
-  container_name: frigate             # docker fallback restart target
-  restart_method: api                 # api | docker
-  restart_fallback: true              # docker restart if verify fails after api restart
-  health_timeout_seconds: 120
+  health_timeout_seconds: 300          # production TensorRT cold boots can exceed 3 min
 
 paths:
   clips_local: /clips                 # this container's view
@@ -447,14 +472,13 @@ paths:
   state_dir: /data/state
 
 capture:
-  source: recordings                  # recordings (loop upgrade) | restream
+  source: recordings                  # recordings (guarded loop search) | live restream capture
   seconds: 300                        # target loop length (longer = harder to spot)
   max_loop_seconds: 1200              # cap on a single loop window
   freeze_clip_seconds: 4
   rtsp_query: mp4                     # codec-filter query appended when capturing
-  parallel: 4                         # concurrent loop searches (phase 2)
-  parallel_frames: 8                  # concurrent live frame grabs (phase 1)
-  engage_deadline_seconds: 15         # fold loops into the first swap if found in time
+  parallel: 4                         # concurrent loop searches
+  parallel_frames: 8                  # concurrent live frame grabs
   keep_clips_after_off: false
   recordings:
     search_hours: 4
@@ -471,14 +495,12 @@ capture:
       block_labels: [person]          # never loop these (must include person)
 
 # NOTE: no on_failure / recordings.fallback — a stream is never left live
-# (§5c). The freeze ladder always yields a clip; abort is infrastructure-only.
+# (§5c). An unresolved stream or broken ladder refuses the whole activation.
 
 streams:                              # global rails, applied AFTER camera→stream resolution
   include: []                         # globs; empty = all
   exclude:
     - camera.birdseye
-    - camera.*_tablet
-    - camera.*_wallpanel
 
 profiles:
   default:
@@ -497,7 +519,9 @@ api:
 
 Config is validated at startup and before each transition (fail fast with a
 line-precise error). Profile `cameras` accepts Frigate camera names; entries
-prefixed `stream:` name a go2rtc stream directly (advanced escape hatch).
+prefixed `stream:` name a go2rtc stream directly (advanced escape hatch). A
+profile with no `mode` resolves to `freeze`; the production default profile
+selects `loop` explicitly.
 
 ## 12. Deployment
 
@@ -521,18 +545,17 @@ compose highlights:
     `./config:/config` mount**, so the frigate container needs NO compose
     change and NO recreate; go2rtc sees clips at `/config/dejavu-clips/…`.
   - `/mnt/frigate/recordings:/recordings:ro` — Frigate's segment files, read
-    directly for loop sourcing (§5b); export API is the automatic fallback.
-  - `/var/run/docker.sock:/var/run/docker.sock` — only for the restart
-    fallback; `restart_method: api` never uses it, but it stays mounted so the
-    fallback works when needed.
+    directly for loop sourcing (§5b); export API is the automatic fallback both
+    when the mount is absent and for individual missing/unreadable candidates.
 - put the appliance on the same Docker network as Frigate so it reaches
-  `frigate:5000/1984/8554` by name; publish `8898` (or assign a routable
-  address) for LAN clients like Home Assistant.
+  `frigate:5000/1984/8554` by name. The example publishes `8898` on host
+  loopback only; configure bearer authentication before making it routable to
+  LAN clients like Home Assistant.
 - `restart: unless-stopped`, healthcheck on `/healthz`.
 - `logging: json-file, max-size 10m, max-file 5` — job output is teed to the
   container stdout (§10.2), so cap the driver's history.
-- The example compose publishes `8898:8898`; drop the mapping if you instead
-  reach the API by container name on Frigate's Docker network.
+- The example compose publishes `127.0.0.1:8898:8898`; drop the mapping if you
+  instead reach the API by container name on Frigate's Docker network.
 
 Monorepo hygiene: all tracked files match existing allowlist rules
 (`*.yaml`, `*.py`, `Dockerfile`, `README.md`, `.env.example`); `SPEC.md`
@@ -546,10 +569,11 @@ ignored (`**/data/`, media-blob backstops).
 | Frigate API unreachable | Transition refused up front; status shows reachability. |
 | Camera offline / no live frame | Descend the freeze ladder (§5c): recorded frame → cached frame → black placeholder. The stream is never left live. |
 | No loopable window for a stream | Stays on its freeze frame (still private); logged, not failed. |
-| Phase-1 engage fails for every stream | Job fails, state `off`, config untouched (a bug — the ladder should always yield a clip). |
+| Requested camera is unsupported / stream is missing | Whole activation fails, state `off`, config untouched. |
+| Phase-1 engage fails for any stream | Whole activation fails, state `off`, config untouched (a bug — the ladder should always yield a clip). |
 | Config save rejected by Frigate validation | Nothing persisted; state `off`/`on` unchanged; error surfaced. |
-| Frigate doesn't come back within timeout | State `error`; operator runs `off` (restore attempt) or `force-restore`. Backup + drift copies always on disk under `data/state/`. |
-| go2rtc didn't apply new config | Detected by §6.8 verification → automatic docker-restart fallback → re-verify → else rollback + `error`. |
+| Frigate doesn't come back within timeout | State `error`; operator restarts Frigate externally, then runs `off` or `force-restore`. Backup + drift copies always remain under `data/state/`. |
+| go2rtc didn't apply new config | Detected by §6.8 verification → restore original sources and restart through Frigate's API → `error`. If the API is unavailable, the operator restarts Frigate externally. |
 | Appliance crash mid-transition | Stale-PID reconciliation → `error`; `off`/`force-restore` recover; pristine backup always available. |
 | User edits Frigate config while privacy on | Preserved by surgical restore; edits to replaced stream entries themselves are overwritten (drift copy saved + warned). |
 
@@ -596,8 +620,8 @@ consumers stays byte-identical to a system without the appliance: no
 proxying, no re-streaming, no transcoding of live feeds, ever. Its standing
 footprint while privacy is off is an unused go2rtc template key, a read-only
 recordings mount, and a 20 s status poll. It touches streams only AT toggle
-time, only the toggled streams (patch mode leaves every other camera
-untouched), and restores the exact original source strings (identical
+time, changes only the selected config entries, and restores the exact original
+source strings (identical
 `nobuffer`/`low_delay` producer args). Any future design that routes live
 media THROUGH the appliance (e.g. an appliance-side RTSP relay) violates
 this contract.
@@ -605,12 +629,14 @@ this contract.
 ## 14. Limitations / non-goals
 
 - Cameras not consumed via go2rtc restream would need input-path rewriting —
-  out of scope (none exist here); such cameras are reported `unsupported`.
+  out of scope (none exist here); such cameras are reported `unsupported` and
+  activation is refused.
 - Recordings/detection during privacy contain the loop (that's the feature).
   Loop-seam motion blips possible in loop mode.
-- Two-restart cost per session; ~10–30 s recording gap each.
+- Every engage and restore performs a full Frigate restart and therefore causes
+  a recording/availability gap while Frigate cold-boots.
 - No scheduling, no per-camera partial privacy UI, no auth beyond the bearer
-  latch, no TLS (front with a reverse proxy if ever needed).
+  token, no built-in TLS (use an authenticated TLS reverse proxy when needed).
 - Frozen-frame clips re-encode once at capture (CPU seconds, one-off); loop
   mode never transcodes.
 
@@ -629,10 +655,11 @@ Each milestone independently testable against the live Frigate with read-only
 or reversible operations; M3 end-to-end test is coordinated with the owner
 (two production restarts).
 
-## 16. Implementation findings (verified during build, 2026-07-07)
+## 16. Production implementation findings (verified 2026-07-07)
 
-Facts discovered while implementing/testing M1-M2 that refine the sections
-above; all verified against the live Frigate 0.17.2 / go2rtc 1.9.10.
+Facts discovered while implementing and deploying the appliance that refine the
+sections above; all were verified against the production Frigate 0.17.2 /
+go2rtc 1.9.10 reference architecture in §2.
 
 - **`GET /api/config/raw` returns a JSON-encoded string** (with a
   `text/plain` content-type). The client unwraps it. `POST /api/config/save`
@@ -645,8 +672,9 @@ above; all verified against the live Frigate 0.17.2 / go2rtc 1.9.10.
   go2rtc crash-loops after restart while the Frigate API stays up. The swap
   therefore uses a **named input template** `go2rtc.ffmpeg.frigate_dejavu_loop`
   (that section is passed through verbatim — the deployment's own `{input}`
-  templates prove it). The template is installed with the swap and removed on
-  restore (prior value preserved if the key ever pre-exists). The appliance
+   templates prove it). The namespaced template is installed on first activation
+   and retained as an unused support entry while privacy is off; a conflicting
+   pre-existing value is refused rather than overwritten. The appliance
   now also **rolls back automatically when the post-restart health gate fails
   while the Frigate API is reachable** — recovery from the M3 incident took
   one `off` (restore verified in 17 s); with the auto-rollback it needs
@@ -668,9 +696,9 @@ above; all verified against the live Frigate 0.17.2 / go2rtc 1.9.10.
   privacy source's `#audio=` params are derived from the captured file (loop)
   or the source probe (freeze) — §4.2's "dropped if audio-less" rule.
 - **Offline cameras answer RTSP DESCRIBE with 404** (go2rtc's on-demand
-  producer can't reach them). At build time two cameras were down — one wired
-  (no route to host), one wifi (timeout) — precisely the `on_failure: skip`
-  path: they stay live-configured, loudly reported.
+  producer can't reach them). The freeze ladder therefore falls through to a
+  recorded, cached, or black frame; if the ladder itself fails, the entire
+  activation is refused before the config swap.
 - **First restore normalizes a few folded YAML lines** (multi-line plain
   scalars re-emit single-line, values identical — proven semantically equal
   by round-trip tests against the production config). One-time cosmetic
@@ -696,15 +724,14 @@ above; all verified against the live Frigate 0.17.2 / go2rtc 1.9.10.
   live capture (observed live, twice in a row). Hence the **settle gate**
   (`frigate.settle_timeout_seconds`, default 240): before sourcing from
   recordings, wait until `/api/exports` actually answers.
-- **NG swap engine (owner directive: no full-frigate restarts, recordings-
-  only sourcing)**, verified live end-to-end (ON 21.7 s, OFF 12.5 s, frigate
-  container untouched, byte-identical restore):
+- **Retired go2rtc-only swap experiment**, previously verified live end-to-end
+  (ON 21.7 s, OFF 12.5 s, Frigate container untouched, byte-identical restore):
   - *Retrieval*: recordings are read DIRECTLY from the segment files
     (`/recordings/<UTC-date>/<HH>/<camera>/<MM.SS>.mp4`, ro mount) — 0.13 s
     per window vs 3-10 s via the export worker, fully parallel, windows are
     segment-aligned. Export API is the automatic fallback; live restream
     capture is opt-in only (`--source restream`), default fallback = skip.
-  - *Effect*: `save_option=saveonly` (persistence) + restart of ONLY the
+  - *Effect tested*: `save_option=saveonly` (persistence) + restart of only the
     embedded go2rtc service. Two traps found on the way: (1) a per-stream
     `PATCH /api/streams` cannot preempt an actively-consumed stream —
     `Producer.SetSource` only changes the URL for the NEXT dial and
@@ -715,12 +742,16 @@ above; all verified against the live Frigate 0.17.2 / go2rtc 1.9.10.
     the wrapper, which regenerates the config from config.yml. Frigate's
     detect/record/DB never restart; per-camera ffmpeg consumers reconnect in
     seconds (activation probes spin the on-demand producers immediately).
-  - *Sync anchor is recency-first* (hour buckets) — a stale max-coverage
+    Later production use showed that this can leave Frigate camera consumers
+    offline even after go2rtc itself recovers, so the mechanism and its helper
+    code were removed. Current toggles always use a coordinated full restart.
+  - *Sync anchor is recency-bounded* (hour buckets) — a stale max-coverage
     anchor (pre-sunset) dragged every camera's candidates into frames the
-    IR guard had to reject (observed); recency ≈ lighting regime outranks
-    coverage. Candidate depth raised to 5 (reads are cheap now).
-  - The full frigate-restart machinery remains as automatic fallback and
-    `swap_method: restart`.
+    IR guard had to reject (observed). Within the newest bucket, full-window
+    coverage outranks short-window coverage; short synchronized loops no longer
+    downgrade cameras that have substantially better full candidates.
+  - Coordinated restart through Frigate's API is now the only apply path. The
+    old strategy setting and all Docker-socket support were removed.
 - **IR switchover is invisible to a luma guard** (owner-reported from live
   screenshots: daylight frozen frames served against IR night views).
   Measured on this deployment at night: IR-lit lawns read luma 56-145 while
@@ -739,7 +770,7 @@ above; all verified against the live Frigate 0.17.2 / go2rtc 1.9.10.
   windows — cloud/exposure jitter alone reaches Δ~15, so guard defaults
   (Δ60 vs live, Δ20 intra-window) are set to catch transitions, not weather.
 
-### Redesign to two-phase engage (2026-07-08)
+### Freeze fallback and loop-search redesign (2026-07-08; activation ordering revised 2026-07-13)
 
 - **The kitchen incident** (root cause, from the DEBUG log): in an all-camera
   freeze at 23:57, `camera.kitchen` stayed LIVE. The kitchen lights had gone
@@ -755,13 +786,15 @@ above; all verified against the live Frigate 0.17.2 / go2rtc 1.9.10.
 - **Owner directives that reshaped the design**: (1) a stream is NEVER left
   live — `on_failure: skip` and `recordings.fallback` are gone; the worst case
   is a freeze frame, which still provides privacy (just not privacy *of the
-  fact that privacy is on*). (2) `abort` is not a config option; it is the
-  "died trying, see the logs" last word, reserved for infrastructure failure.
+  fact that privacy is on*). (2) `abort` is not a config option; unresolved
+  targets, invariant failures, or infrastructure errors refuse the whole
+  activation rather than degrading.
   (3) The other way to hide a transient is to make the loop LONGER, so one car
   in 20 min reads as ordinary — repetition is the tell, not the car. Absolute
   quiet is still preferred; fooling the eye is the priority when it isn't
-  achievable. (4) Engage IMMEDIATELY (live freeze frame), do the expensive loop
-  search in the background, upgrade when it lands.
+  achievable. (4) The original design engaged immediately on a freeze and
+  searched in the background. Production go2rtc reload failures later retired
+  that ordering: searches now finish before one coordinated Frigate restart.
 - **Fixes**: freshness is now a direct `_segment_settled` size-stability test
   (young settled segments are fine), not a blunt age margin (the export-worker
   wedge still uses the 30 s margin, which is the only place it was ever needed).
@@ -772,7 +805,7 @@ above; all verified against the live Frigate 0.17.2 / go2rtc 1.9.10.
   23:57 segment data: kitchen now screens past the six pre-flip colour windows
   and picks the 23:57:02 IR window (and would freeze on a live IR frame even if
   it hadn't).
-- **Verified engage costs** (2026-07-08, live frame grabs): one live freeze
+- **Verified preparation costs** (2026-07-08, live frame grabs): one live freeze
   frame is ~2.4-6 s per camera (probe + grab + synth); at `parallel_frames: 8`
-  a 22-camera profile engages in ~3 waves. The `engage_deadline_seconds` (15)
-  decides per-run whether loops fold into the first swap or upgrade after.
+  a 22-camera profile prepares in ~3 waves. Loop searches run in parallel and
+  all complete before the single activation restart.

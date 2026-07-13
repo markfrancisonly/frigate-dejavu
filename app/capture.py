@@ -343,7 +343,7 @@ def validate_clip(path, expect_seconds):
 def frame_from_live(stream, url, tmp_dir, cancel, progress):
     """One frame of what the camera sees RIGHT NOW, plus the stream's probe.
 
-    This is how dejavu engages: instant, and lighting-correct by construction
+    This prepares dejavu's safe fallback and is lighting-correct by construction
     (no IR/brightness guard can disagree with the present moment). The caller
     keeps the PNG — its stats are the reference every recorded candidate is
     later screened against. Returns (png_path, source_meta)."""
