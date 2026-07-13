@@ -20,7 +20,7 @@ import frigate as frigate_mod
 from config import ConfigError
 from core import Busy, Invalid, JobError
 
-MUTATING = {"on", "off", "cancel", "force-restore", "seed-template"}
+MUTATING = {"on", "off", "cancel", "force-restore"}
 
 
 def _setup_logging(cfg, args):
@@ -108,27 +108,14 @@ def build_parser():
         "or live restream capture",
     )
     on.add_argument(
-        "--swap",
-        choices=["go2rtc", "restart"],
-        default=None,
-        help="apply mechanism: go2rtc service reload (default, frigate "
-        "stays up) or full frigate restart",
-    )
-    on.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the replacement plan (incl. chosen quiet windows) "
+        help="print the replacement plan (incl. metadata window candidates) "
         "without acting",
     )
 
-    off = sub.add_parser(
+    sub.add_parser(
         "off", help="restore original sources " "(cancels an in-flight capture)"
-    )
-    off.add_argument(
-        "--swap",
-        choices=["go2rtc", "restart"],
-        default=None,
-        help="restore mechanism (default: go2rtc, restart fallback)",
     )
     sub.add_parser("cancel", help="alias of 'off' while a capture is running")
 
@@ -141,12 +128,6 @@ def build_parser():
     sub.add_parser(
         "force-restore",
         help="write the pristine whole-file backup " "verbatim and restart frigate",
-    )
-    sub.add_parser(
-        "seed-template",
-        help="one-time: persist the loop template and "
-        "restart frigate once so later toggles "
-        "need no restarts",
     )
     return p
 
@@ -197,17 +178,14 @@ def main(argv=None):
                 cameras=cameras,
                 capture_seconds=args.capture_seconds,
                 source=args.source,
-                swap=args.swap,
                 dry_run=args.dry_run,
             )
         if args.command == "off":
-            return core.cmd_off(cfg, swap=args.swap)
+            return core.cmd_off(cfg)
         if args.command == "cancel":
             return core.cmd_cancel(cfg)
         if args.command == "force-restore":
             return core.cmd_force_restore(cfg)
-        if args.command == "seed-template":
-            return core.cmd_seed_template(cfg)
         if args.command == "status":
             snap = core.get_status(cfg, live=True)
             if args.as_json:

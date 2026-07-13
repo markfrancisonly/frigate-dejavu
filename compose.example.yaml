@@ -44,23 +44,18 @@ services:
 
       # EDIT: your Frigate CONFIG dir. The appliance writes replay clips into a
       # `dejavu-clips/` subfolder that Frigate's embedded go2rtc already serves,
-      # so Frigate itself needs NO config change and NO restart.
+      # so Frigate needs no additional mount or Compose change.
       - /path/to/frigate/config/dejavu-clips:/clips
 
-      # EDIT: your Frigate RECORDINGS dir (read-only). Loop windows are sourced
-      # straight from these segment files.
+      # EDIT: your Frigate RECORDINGS dir (read-only). Segment files are the
+      # fast path; missing/unreadable candidates retry through Frigate export.
       - /path/to/frigate/recordings:/recordings:ro
 
-      # Only used when config.yaml sets `restart_method: docker`; the default
-      # `api` path uses Frigate's own /api/restart and never touches the socket.
-      # Delete this mount if you'd rather not grant Docker control.
-      - /var/run/docker.sock:/var/run/docker.sock
-
-    # INBOUND — how clients reach this appliance. Publishes the REST API so
-    # Home Assistant / curl can hit http://<docker-host>:8898. Remove if you
-    # only ever call it by container name from the same Docker network.
+    # INBOUND — safe default: publish the REST API on the Docker host's loopback
+    # only. For Home Assistant on another host, first set DEJAVU_API_TOKEN, then
+    # change this to "8898:8898" (or use an authenticated reverse proxy).
     ports:
-      - "8898:8898"
+      - "127.0.0.1:8898:8898"
 
     # OUTBOUND — how this appliance reaches Frigate. It resolves `frigate` to
     # call Frigate's API (:5000), go2rtc (:1984) and RTSP (:8554) — see the URLs

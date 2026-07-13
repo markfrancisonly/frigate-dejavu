@@ -34,6 +34,7 @@ except config_mod.ConfigError as exc:
 frigate_mod.init_http(CFG)
 TOKEN = CFG["api"]["bearer_token"]
 app = Flask("frigate-dejavu")
+_ON_FIELDS = frozenset({"profile", "mode", "cameras", "capture_seconds", "source"})
 
 
 @app.before_request
@@ -80,7 +81,25 @@ def _busy(exc):
 
 @app.post("/api/dejavu/on")
 def dejavu_on():
-    body = request.get_json(silent=True) or {}
+    # An empty POST intentionally means "use the default profile" (all cameras
+    # in the reference config). Once a body is supplied, require a valid JSON
+    # object so a typo cannot silently broaden the request to that default.
+    raw_body = request.get_data(cache=True)
+    if not raw_body:
+        body = {}
+    else:
+        if not request.is_json:
+            return jsonify({"error": "request body must be a JSON object"}), 400
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"error": "request body must be a JSON object"}), 400
+    unknown = sorted(set(body) - _ON_FIELDS)
+    if unknown:
+        return (
+            jsonify({"error": "unknown request field(s): " + ", ".join(unknown)}),
+            400,
+        )
+
     profile = body.get("profile")
     mode = body.get("mode")
     cameras = body.get("cameras")
@@ -104,14 +123,24 @@ def dejavu_on():
     if source is not None and source not in ("recordings", "restream"):
         return jsonify({"error": "source must be 'recordings' or 'restream'"}), 400
     if isinstance(cameras, str):
-        cameras = [c.strip() for c in cameras.split(",") if c.strip()]
-    if cameras is not None and (
-        not isinstance(cameras, list)
-        or not all(isinstance(c, str) and c for c in cameras)
-    ):
-        return jsonify({"error": "cameras must be a list of strings"}), 400
+        if not cameras.strip():
+            return jsonify({"error": "cameras must not be blank; use [] for all"}), 400
+        cameras = [c.strip() for c in cameras.split(",")]
+    if cameras is not None:
+        if not isinstance(cameras, list) or not all(
+            isinstance(c, str) for c in cameras
+        ):
+            return jsonify({"error": "cameras must be a list of strings"}), 400
+        cameras = [c.strip() for c in cameras]
+        if any(not c for c in cameras):
+            return (
+                jsonify({"error": "camera names must not be blank; use [] for all"}),
+                400,
+            )
     if capture_seconds is not None and (
-        not isinstance(capture_seconds, int) or capture_seconds < 1
+        not isinstance(capture_seconds, int)
+        or isinstance(capture_seconds, bool)
+        or capture_seconds < 1
     ):
         return jsonify({"error": "capture_seconds must be a positive integer"}), 400
 
@@ -129,7 +158,7 @@ def dejavu_on():
         args += ["--mode", mode]
     if cameras is not None:
         args += ["--cameras", ",".join(cameras)]
-    if capture_seconds:
+    if capture_seconds is not None:
         args += ["--capture-seconds", str(capture_seconds)]
     if source:
         args += ["--source", source]
