@@ -6,31 +6,26 @@
 #   1. the host paths to your Frigate config + recordings dirs
 #   2. the Docker network your Frigate container is on
 # Then:   docker compose up -d --build
-#
-# Your real `compose.yaml` is gitignored, so these edits never get committed.
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
   frigate-dejavu:
-    build: .
-    image: frigate-dejavu:local
+    image: ghcr.io/markfrancisonly/frigate-dejavu:latest
+    pull_policy: always
     container_name: frigate-dejavu
     restart: unless-stopped
-    init: true                       # reap the short-lived ffmpeg/curl children
+    init: true                        # reap the short-lived ffmpeg children
 
     environment:
-      - TZ=Etc/UTC                   # EDIT: your timezone (log timestamps only)
-      # Optional REST bearer token; empty/unset disables API auth. Put the real
-      # value in a gitignored `.env` file (see .env.example) — never inline here.
-      - DEJAVU_API_TOKEN=${DEJAVU_API_TOKEN:-}
-      - DEJAVU_LOG_LEVEL=${DEJAVU_LOG_LEVEL:-INFO}
-      # Optional Frigate API credentials (authenticated :8971 port only; the
-      # internal :5000 needs none) — set in the gitignored .env.
-      - DEJAVU_FRIGATE_TOKEN=${DEJAVU_FRIGATE_TOKEN:-}
-      - DEJAVU_FRIGATE_USER=${DEJAVU_FRIGATE_USER:-}
-      - DEJAVU_FRIGATE_PASSWORD=${DEJAVU_FRIGATE_PASSWORD:-}
+      TZ: Etc/UTC
+      DEJAVU_CONFIG: /config/config.yaml
+      DEJAVU_LOG_LEVEL: INFO
+      DEJAVU_API_TOKEN: ""
+      DEJAVU_FRIGATE_TOKEN: ""
+      DEJAVU_FRIGATE_USER: ""
+      DEJAVU_FRIGATE_PASSWORD: ""
 
-    # Cap container-log growth; set DEJAVU_LOG_LEVEL=DEBUG for full forensics.
+    # Cap container-log growth.
     logging:
       driver: json-file
       options:
@@ -38,36 +33,14 @@ services:
         max-file: "5"
 
     volumes:
-      # This appliance's own files:
       - ./config.yaml:/config/config.yaml:ro   # copy of config.example.yaml
       - ./data:/data                           # runtime state, logs, clip index
 
-      # EDIT: your Frigate CONFIG dir. The appliance writes replay clips into a
-      # `dejavu-clips/` subfolder that Frigate's embedded go2rtc already serves,
-      # so Frigate needs no additional mount or Compose change.
+      # EDIT: Frigate's config/dejavu-clips directory (new), shared with go2rtc.
       - /path/to/frigate/config/dejavu-clips:/clips
 
-      # EDIT: your Frigate RECORDINGS dir (read-only). Segment files are the
-      # fast path; missing/unreadable candidates retry through Frigate export.
+      # EDIT: Frigate's recordings directory (existing); export handles missing segments.
       - /path/to/frigate/recordings:/recordings:ro
 
-    # INBOUND — safe default: publish the REST API on the Docker host's loopback
-    # only. For Home Assistant on another host, first set DEJAVU_API_TOKEN, then
-    # change this to "8898:8898" (or use an authenticated reverse proxy).
     ports:
-      - "127.0.0.1:8898:8898"
-
-    # OUTBOUND — how this appliance reaches Frigate. It resolves `frigate` to
-    # call Frigate's API (:5000), go2rtc (:1984) and RTSP (:8554) — see the URLs
-    # in config.yaml — so it must share a Docker network with your Frigate
-    # container. Find that network with:
-    #   docker inspect frigate -f '{{json .NetworkSettings.Networks}}'
-    networks:
-      - frigate
-
-networks:
-  # EDIT: replace `frigate` with the name of the network your Frigate container
-  # is already on. `external: true` means Compose joins it rather than creating
-  # a new one.
-  frigate:
-    external: true
+      - "8898:8898"

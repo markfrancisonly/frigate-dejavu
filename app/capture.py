@@ -46,6 +46,15 @@ class CancelToken:
     def register(self, proc):
         with self._lock:
             self._procs.add(proc)
+            cancelled = self._event.is_set()
+        # If cancellation already fired, cancel() will not run again for this
+        # proc — terminate it now so a process started just after the deadline
+        # (or an 'off') cannot run to completion and overshoot the budget.
+        if cancelled:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
 
     def unregister(self, proc):
         with self._lock:
@@ -161,12 +170,29 @@ def summarize_probe(js):
 # --------------------------------------------------------------------------
 
 
-def _finalize(part, out_path):
-    os.replace(part, out_path)
+def _write_clip(cmd, out_path, timeout, cancel, what):
+    """Run ffmpeg into a disposable part file, then atomically publish it."""
+    part = out_path + ".part.mp4"
+    try:
+        _run(cmd + ["-movflags", "+faststart", part], timeout, cancel, what)
+        os.replace(part, out_path)
+    finally:
+        if os.path.exists(part):
+            os.unlink(part)
+
+
+def _silent_audio_input(meta):
+    layout = "mono" if (meta.get("channels") or 1) == 1 else "stereo"
+    return [
+        "-f",
+        "lavfi",
+        "-i",
+        f"anullsrc=channel_layout={layout}:"
+        f"sample_rate={meta.get('sample_rate') or 48000}",
+    ]
 
 
 def capture_clip(url, out_path, seconds, cancel):
-    part = out_path + ".part.mp4"
     # first video track + first audio track (if any packets actually flow);
     # deterministic vs ffmpeg's "best stream" default selection
     cmd = (
@@ -183,17 +209,11 @@ def capture_clip(url, out_path, seconds, cancel):
             "0:a:0?",
             "-c",
             "copy",
-            "-movflags",
-            "+faststart",
-            part,
         ]
     )
-    try:
-        _run(cmd, seconds + 120, cancel, f"capture {os.path.basename(out_path)}")
-        _finalize(part, out_path)
-    finally:
-        if os.path.exists(part):
-            os.unlink(part)
+    _write_clip(
+        cmd, out_path, seconds + 120, cancel, f"capture {os.path.basename(out_path)}"
+    )
 
 
 def grab_frame(url, png_path, cancel):
@@ -212,14 +232,7 @@ def synthesize_freeze(png_path, out_path, meta, seconds, cancel):
 
     cmd = FFMPEG_BASE + ["-loop", "1", "-framerate", f"{fps:.3f}", "-i", png_path]
     if has_audio:
-        layout = "mono" if (meta.get("channels") or 1) == 1 else "stereo"
-        rate = meta.get("sample_rate") or 48000
-        cmd += [
-            "-f",
-            "lavfi",
-            "-i",
-            f"anullsrc=channel_layout={layout}:sample_rate={rate}",
-        ]
+        cmd += _silent_audio_input(meta)
     cmd += ["-t", str(seconds), "-map", "0:v"]
     if has_audio:
         cmd += ["-map", "1:a", "-c:a", "aac"]
@@ -239,14 +252,9 @@ def synthesize_freeze(png_path, out_path, meta, seconds, cancel):
         cmd += ["-tune", "stillimage"]
     else:
         cmd += ["-x265-params", "log-level=error"]
-    part = out_path + ".part.mp4"
-    cmd += ["-movflags", "+faststart", part]
-    try:
-        _run(cmd, 300, cancel, f"freeze synth {os.path.basename(out_path)}")
-        _finalize(part, out_path)
-    finally:
-        if os.path.exists(part):
-            os.unlink(part)
+    _write_clip(
+        cmd, out_path, 300, cancel, f"freeze synth {os.path.basename(out_path)}"
+    )
 
 
 PLACEHOLDER_META = {
@@ -281,19 +289,7 @@ def synthesize_placeholder(out_path, meta, seconds, cancel):
     ]
     has_audio = bool(meta.get("audio_codec"))
     if has_audio:
-        layout = "mono" if (meta.get("channels") or 1) == 1 else "stereo"
-        rate = meta.get("sample_rate") or 48000
-        cmd += [
-            "-f",
-            "lavfi",
-            "-i",
-            f"anullsrc=channel_layout={layout}:sample_rate={rate}",
-            "-map",
-            "1:a",
-            "-c:a",
-            "aac",
-            "-shortest",
-        ]
+        cmd += _silent_audio_input(meta) + ["-map", "1:a", "-c:a", "aac", "-shortest"]
     cmd += [
         "-map",
         "0:v",
@@ -310,14 +306,9 @@ def synthesize_placeholder(out_path, meta, seconds, cancel):
     ]
     if vcodec != "libx264":
         cmd += ["-x265-params", "log-level=error"]
-    part = out_path + ".part.mp4"
-    cmd += ["-movflags", "+faststart", part]
-    try:
-        _run(cmd, 120, cancel, f"placeholder synth {os.path.basename(out_path)}")
-        _finalize(part, out_path)
-    finally:
-        if os.path.exists(part):
-            os.unlink(part)
+    _write_clip(
+        cmd, out_path, 120, cancel, f"placeholder synth {os.path.basename(out_path)}"
+    )
     return has_audio
 
 
@@ -335,6 +326,13 @@ def validate_clip(path, expect_seconds):
     return meta
 
 
+def _source_meta(url, cancel):
+    meta = summarize_probe(probe_url(url, cancel))
+    if not meta["video_codec"]:
+        raise CaptureError("stream offers no video")
+    return meta
+
+
 # --------------------------------------------------------------------------
 # per-stream pipeline + parallel runner
 # --------------------------------------------------------------------------
@@ -348,9 +346,7 @@ def frame_from_live(stream, url, tmp_dir, cancel, progress):
     keeps the PNG — its stats are the reference every recorded candidate is
     later screened against. Returns (png_path, source_meta)."""
     progress(stream, "probing")
-    source_meta = summarize_probe(probe_url(url, cancel))
-    if not source_meta["video_codec"]:
-        raise CaptureError("stream offers no video")
+    source_meta = _source_meta(url, cancel)
     png = os.path.join(tmp_dir, f"{stream}.frame.png")
     progress(stream, "grabbing live frame")
     grab_frame(url, png, cancel)
@@ -367,9 +363,7 @@ def capture_stream(
     out_path = os.path.join(clips_dir, f"{stream}.dejavu.mp4")
     if mode == "loop":
         progress(stream, "probing")
-        source_meta = summarize_probe(probe_url(url, cancel))
-        if not source_meta["video_codec"]:
-            raise CaptureError("stream offers no video")
+        source_meta = _source_meta(url, cancel)
         progress(stream, f"capturing {seconds}s")
         capture_clip(url, out_path, seconds, cancel)
         clip_meta = validate_clip(out_path, seconds)

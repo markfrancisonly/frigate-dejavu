@@ -1,8 +1,9 @@
 name: Build
 
 # Simplified docker image build (modeled on go2rtc's build workflow):
-# - pushes to `master` publish ghcr.io/<owner>/frigate-dejavu:latest
-# - tags `v*` publish the matching semver tags (v1.2.3 -> 1.2.3, 1.2, 1)
+# - pushes to `master` publish `latest` and an immutable `sha-*` tag
+# - stable tags publish semver tags and update `latest`
+#   (v1.2.3 -> latest, 1.2.3, 1.2, 1, sha-*); prereleases do not update latest
 # - pull requests run quality checks and BUILD the image (nothing is pushed)
 # No registry secrets needed: images go to GitHub's own registry (GHCR)
 # using the workflow's built-in GITHUB_TOKEN.
@@ -14,6 +15,7 @@ on:
     paths:
       - app/**
       - tests/**
+      - .dockerignore
       - Dockerfile
       - requirements.txt
       - config.example.yaml
@@ -68,6 +70,39 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Build smoke-test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: frigate-dejavu:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test image
+        run: |
+          docker run --detach --name frigate-dejavu-smoke \
+            --publish 127.0.0.1:8898:8898 \
+            --volume "$PWD/config.example.yaml:/config/config.yaml:ro" \
+            --env DEJAVU_API_TOKEN= \
+            --env DEJAVU_FRIGATE_TOKEN= \
+            --env DEJAVU_FRIGATE_USER= \
+            --env DEJAVU_FRIGATE_PASSWORD= \
+            frigate-dejavu:smoke
+          trap 'docker rm --force frigate-dejavu-smoke >/dev/null 2>&1 || true' EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8898/healthz >/dev/null; then
+              docker exec frigate-dejavu-smoke python3 -c \
+                "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8898/healthz', timeout=3).read()"
+              docker exec frigate-dejavu-smoke dejavu --help >/dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs frigate-dejavu-smoke
+          exit 1
 
       - name: Docker meta
         id: meta

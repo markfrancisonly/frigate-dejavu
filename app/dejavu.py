@@ -157,6 +157,20 @@ def _print_status(snap):
             print(f"  {name:<36} {info.get('phase', '?'):<28} {cams}")
 
 
+def _print_profiles(profiles):
+    for name in sorted(profiles):
+        profile = profiles[name]
+        cameras = (
+            profile["cameras"]
+            if isinstance(profile["cameras"], str)
+            else ", ".join(profile["cameras"])
+        )
+        print(
+            f"{name:<16} mode={profile['mode']:<7} "
+            f"capture={profile['capture_seconds']}s  cameras: {cameras}"
+        )
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
@@ -180,35 +194,23 @@ def main(argv=None):
                 source=args.source,
                 dry_run=args.dry_run,
             )
-        if args.command == "off":
-            return core.cmd_off(cfg)
-        if args.command == "cancel":
-            return core.cmd_cancel(cfg)
-        if args.command == "force-restore":
-            return core.cmd_force_restore(cfg)
-        if args.command == "status":
-            snap = core.get_status(cfg, live=True)
+        mutations = {
+            "off": core.cmd_off,
+            "cancel": core.cmd_cancel,
+            "force-restore": core.cmd_force_restore,
+        }
+        if args.command in mutations:
+            return mutations[args.command](cfg)
+        if args.command in ("status", "profiles"):
+            result = (
+                core.get_status(cfg, live=True)
+                if args.command == "status"
+                else core.resolved_profiles(cfg)
+            )
             if args.as_json:
-                print(json.dumps(snap, indent=2, sort_keys=True))
+                print(json.dumps(result, indent=2, sort_keys=True))
             else:
-                _print_status(snap)
-            return 0
-        if args.command == "profiles":
-            profiles = core.resolved_profiles(cfg)
-            if args.as_json:
-                print(json.dumps(profiles, indent=2, sort_keys=True))
-            else:
-                for name in sorted(profiles):
-                    p = profiles[name]
-                    cams = (
-                        p["cameras"]
-                        if isinstance(p["cameras"], str)
-                        else ", ".join(p["cameras"])
-                    )
-                    print(
-                        f"{name:<16} mode={p['mode']:<7} capture={p['capture_seconds']}s"
-                        f"  cameras: {cams}"
-                    )
+                (_print_status if args.command == "status" else _print_profiles)(result)
             return 0
         raise Invalid(f"unknown command {args.command!r}")
 

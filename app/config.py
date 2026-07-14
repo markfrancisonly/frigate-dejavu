@@ -1,4 +1,4 @@
-"""Appliance configuration: load /config/config.yaml, merge defaults, validate.
+"""Load config, replace {DEJAVU_*} environment references, merge, and validate.
 
 Validated at startup and before every transition — fail fast with a precise
 key-path error (SPEC §11).
@@ -6,6 +6,7 @@ key-path error (SPEC §11).
 
 import copy
 import os
+import re
 
 from ruamel.yaml import YAML
 
@@ -15,6 +16,7 @@ class ConfigError(Exception):
 
 
 DEFAULT_CONFIG_PATH = "/config/config.yaml"
+ENV_PATTERN = re.compile(r"\{(DEJAVU_[A-Za-z0-9_]+)\}")
 
 DEFAULTS = {
     "frigate": {
@@ -49,6 +51,12 @@ DEFAULTS = {
         "parallel": 4,
         "parallel_frames": 8,
         "keep_clips_after_off": False,
+        # Stage-2 budget: once privacy is ON (freeze), loops are assembled in the
+        # background from recordings and swapped in via one more restart. This
+        # bounds that best-effort work; a stream whose loop is not ready in time
+        # stays on its freeze clip permanently. Generous by design — privacy is
+        # already guaranteed. 0 = unbounded (still cancellable by 'off').
+        "loop_assembly_budget_seconds": 900,
         "recordings": {
             "search_hours": 4,
             "min_seconds": 20,
@@ -90,20 +98,37 @@ def _deep_merge(base, override):
     return out
 
 
+def _replace_env(value):
+    if isinstance(value, str):
+
+        def replace(match):
+            name = match.group(1)
+            if name not in os.environ:
+                raise ConfigError(f"environment variable {name} is not set")
+            return os.environ[name]
+
+        return ENV_PATTERN.sub(replace, value)
+    if isinstance(value, list):
+        return [_replace_env(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_env(item) for key, item in value.items()}
+    return value
+
+
 def _require(cond, path, msg):
     if not cond:
         raise ConfigError(f"config error at '{path}': {msg}")
 
 
-def _pos_int(cfg, path, minimum=1):
+def _int_value(cfg, path, minimum=1, maximum=None):
     node = cfg
     for part in path.split("."):
         node = node[part]
-    _require(
-        isinstance(node, int) and not isinstance(node, bool) and node >= minimum,
-        path,
-        f"must be an integer >= {minimum} (got {node!r})",
+    valid = (
+        type(node) is int and node >= minimum and (maximum is None or node <= maximum)
     )
+    bounds = f"{minimum}-{maximum}" if maximum is not None else f">= {minimum}"
+    _require(valid, path, f"must be an integer {bounds} (got {node!r})")
 
 
 def _str_list(value, path):
@@ -126,8 +151,8 @@ def validate(cfg):
             f"frigate.{key}",
             "must be a non-empty string",
         )
-    _pos_int(cfg, "frigate.health_timeout_seconds")
-    _pos_int(cfg, "frigate.settle_timeout_seconds")
+    _int_value(cfg, "frigate.health_timeout_seconds")
+    _int_value(cfg, "frigate.settle_timeout_seconds")
 
     auth = cfg["frigate"].get("api_auth") or {}
     for key in ("token", "user", "password"):
@@ -157,16 +182,20 @@ def validate(cfg):
         )
 
     cap = cfg["capture"]
-    _pos_int(cfg, "capture.seconds")
-    _pos_int(cfg, "capture.max_loop_seconds")
-    _pos_int(cfg, "capture.freeze_clip_seconds")
-    _pos_int(cfg, "capture.parallel")
-    _pos_int(cfg, "capture.parallel_frames")
+    for key in (
+        "seconds",
+        "max_loop_seconds",
+        "freeze_clip_seconds",
+        "parallel",
+        "parallel_frames",
+    ):
+        _int_value(cfg, f"capture.{key}")
     _require(
         cap["max_loop_seconds"] >= cap["seconds"],
         "capture.max_loop_seconds",
         f"must be >= capture.seconds ({cap['seconds']})",
     )
+    _int_value(cfg, "capture.loop_assembly_budget_seconds", 0)
     _require(
         isinstance(cap.get("rtsp_query"), str),
         "capture.rtsp_query",
@@ -184,12 +213,8 @@ def validate(cfg):
     )
     rec = cap.get("recordings")
     _require(isinstance(rec, dict), "capture.recordings", "must be a mapping")
-    _pos_int(cfg, "capture.recordings.search_hours")
-    _require(
-        isinstance(rec.get("min_seconds"), int) and rec["min_seconds"] >= 5,
-        "capture.recordings.min_seconds",
-        "must be an integer >= 5",
-    )
+    _int_value(cfg, "capture.recordings.search_hours")
+    _int_value(cfg, "capture.recordings.min_seconds", 5)
     _require(
         rec.get("audio") in ("silence", "keep", "strip"),
         "capture.recordings.audio",
@@ -203,13 +228,7 @@ def validate(cfg):
         "capture.recordings.dilute.enabled",
         "must be a boolean",
     )
-    _require(
-        isinstance(dil.get("min_seconds"), int)
-        and not isinstance(dil["min_seconds"], bool)
-        and dil["min_seconds"] >= 30,
-        "capture.recordings.dilute.min_seconds",
-        "must be an integer >= 30 (a short loop cannot dilute anything)",
-    )
+    _int_value(cfg, "capture.recordings.dilute.min_seconds", 30)
     frac = dil.get("max_activity_fraction")
     _require(
         isinstance(frac, (int, float))
@@ -226,23 +245,13 @@ def validate(cfg):
     )
 
     for key in ("max_brightness_delta", "max_brightness_drift"):
-        val = rec.get(key)
-        _require(
-            isinstance(val, int) and not isinstance(val, bool) and 0 <= val <= 255,
-            f"capture.recordings.{key}",
-            "must be an integer 0-255 (0 disables)",
-        )
+        _int_value(cfg, f"capture.recordings.{key}", 0, 255)
     _require(
         isinstance(rec.get("match_ir_mode"), bool),
         "capture.recordings.match_ir_mode",
         "must be a boolean",
     )
-    tol = rec.get("sync_tolerance_minutes")
-    _require(
-        isinstance(tol, int) and not isinstance(tol, bool) and 0 <= tol <= 1440,
-        "capture.recordings.sync_tolerance_minutes",
-        "must be an integer 0-1440 minutes (0 disables cross-camera sync)",
-    )
+    _int_value(cfg, "capture.recordings.sync_tolerance_minutes", 0, 1440)
 
     _str_list(cfg["streams"].get("include", []), "streams.include")
     _str_list(cfg["streams"].get("exclude", []), "streams.exclude")
@@ -257,7 +266,11 @@ def validate(cfg):
     for name, prof in profiles.items():
         prof = {} if prof is None else prof
         _require(isinstance(prof, dict), f"profiles.{name}", "must be a mapping")
-        unknown = sorted(set(prof) - {"mode", "cameras", "capture_seconds", "source"})
+        unknown = sorted(
+            str(key)
+            for key in prof
+            if key not in {"mode", "cameras", "capture_seconds", "source"}
+        )
         _require(
             not unknown, f"profiles.{name}", "unknown key(s): " + ", ".join(unknown)
         )
@@ -287,11 +300,7 @@ def validate(cfg):
     _require(
         isinstance(api.get("bearer_token"), str), "api.bearer_token", "must be a string"
     )
-    _require(
-        isinstance(api.get("debounce_seconds"), int) and api["debounce_seconds"] >= 0,
-        "api.debounce_seconds",
-        "must be an integer >= 0",
-    )
+    _int_value(cfg, "api.debounce_seconds", 0)
     api_listen(cfg)  # raises on malformed listen
 
 
@@ -320,32 +329,19 @@ def load_config(path=None):
         user = {}
     if not isinstance(user, dict):
         raise ConfigError(f"{path}: top level must be a mapping")
+    user = _replace_env(user)
 
     cfg = _deep_merge(DEFAULTS, user)
 
     # profiles are authored as a whole; a user-supplied profile replaces the
     # same-named default rather than deep-merging camera lists into it.
     if isinstance(user.get("profiles"), dict) and user["profiles"]:
-        profiles = {}
-        for name, prof in user["profiles"].items():
-            profiles[name] = copy.deepcopy(prof) if prof is not None else {}
-        if "default" not in profiles:
-            profiles["default"] = copy.deepcopy(DEFAULTS["profiles"]["default"])
+        profiles = {
+            name: copy.deepcopy(prof) if prof is not None else {}
+            for name, prof in user["profiles"].items()
+        }
+        profiles.setdefault("default", copy.deepcopy(DEFAULTS["profiles"]["default"]))
         cfg["profiles"] = profiles
-
-    env_token = os.environ.get("DEJAVU_API_TOKEN", "")
-    if env_token:
-        cfg["api"]["bearer_token"] = env_token
-
-    # Frigate API credentials may come from env instead of the config file.
-    for env, key in (
-        ("DEJAVU_FRIGATE_TOKEN", "token"),
-        ("DEJAVU_FRIGATE_USER", "user"),
-        ("DEJAVU_FRIGATE_PASSWORD", "password"),
-    ):
-        val = os.environ.get(env, "")
-        if val:
-            cfg["frigate"]["api_auth"][key] = val
 
     validate(cfg)
     return cfg

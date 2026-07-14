@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import re
+import time
 
 import requests
 from ruamel.yaml import YAML
@@ -225,8 +226,6 @@ class FrigateClient:
     # -- restart/health orchestration ---------------------------------------
 
     def wait_down(self, timeout=30):
-        import time
-
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if not self.is_up():
@@ -237,8 +236,6 @@ class FrigateClient:
 
     def wait_healthy(self, timeout):
         """Frigate /api/version AND go2rtc /api/streams up, twice in a row."""
-        import time
-
         deadline = time.monotonic() + timeout
         consecutive = 0
         while time.monotonic() < deadline:
@@ -305,7 +302,16 @@ def normalize_sources(value):
 
 
 def _match_any(name, patterns):
-    return any(name == p or fnmatch.fnmatchcase(name, p) for p in patterns)
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+def _resolve_patterns(patterns, names):
+    groups = [
+        [name for name in names if fnmatch.fnmatchcase(name, pattern)]
+        for pattern in patterns
+    ]
+    selected = list(dict.fromkeys(name for group in groups for name in group))
+    return selected, [pattern for pattern, group in zip(patterns, groups) if not group]
 
 
 def camera_stream_refs(data, camera):
@@ -342,18 +348,11 @@ def resolve_streams(data, cfg, camera_patterns):
         p[len("stream:") :] for p in camera_patterns if p.startswith("stream:")
     ]
 
-    unknown = []
     if not camera_patterns:
         cameras = list(all_cameras)
+        unknown = []
     else:
-        cameras = []
-        for pat in cam_pats:
-            matches = [
-                c for c in all_cameras if c == pat or fnmatch.fnmatchcase(c, pat)
-            ]
-            if not matches:
-                unknown.append(pat)
-            cameras.extend(m for m in matches if m not in cameras)
+        cameras, unknown = _resolve_patterns(cam_pats, all_cameras)
 
     plan = {}
     unsupported = []
@@ -370,12 +369,10 @@ def resolve_streams(data, cfg, camera_patterns):
                 # codec-identical loop material (SPEC §5b)
                 entry["record_cameras"].append(cam)
 
-    for pat in stream_pats:
-        matches = [s for s in all_streams if s == pat or fnmatch.fnmatchcase(s, pat)]
-        if not matches:
-            unknown.append(f"stream:{pat}")
-        for s in matches:
-            plan.setdefault(s, {"cameras": [], "record_cameras": []})
+    streams, unmatched = _resolve_patterns(stream_pats, all_streams)
+    unknown += [f"stream:{pattern}" for pattern in unmatched]
+    for stream in streams:
+        plan.setdefault(stream, {"cameras": [], "record_cameras": []})
 
     include = cfg["streams"].get("include") or []
     exclude = cfg["streams"].get("exclude") or []
@@ -524,10 +521,7 @@ def _stream_blob(streams_json, name):
     return json.dumps(entry) if entry is not None else ""
 
 
-def verify_dejavu_applied(client, expect_clips, retries=3, delay=2):
-    """Each replaced stream's go2rtc producer must reference its dejavu clip."""
-    import time
-
+def _verify_clips(client, expect_clips, present, retries, delay):
     bad, last_exc = list(expect_clips), None
     for _ in range(retries):
         try:
@@ -536,31 +530,24 @@ def verify_dejavu_applied(client, expect_clips, retries=3, delay=2):
             last_exc = exc
             time.sleep(delay)
             continue
-        bad = [s for s, clip in expect_clips.items() if clip not in _stream_blob(js, s)]
+        bad = [
+            s
+            for s, clip in expect_clips.items()
+            if (clip in _stream_blob(js, s)) != present
+        ]
         if not bad:
             return True, []
         time.sleep(delay)
     if last_exc is not None:
         log.warning("go2rtc verification degraded: %s", last_exc)
     return False, bad
+
+
+def verify_dejavu_applied(client, expect_clips, retries=3, delay=2):
+    """Each replaced stream's go2rtc producer must reference its dejavu clip."""
+    return _verify_clips(client, expect_clips, True, retries, delay)
 
 
 def verify_dejavu_removed(client, expect_clips, retries=3, delay=2):
     """No replaced stream may still reference its dejavu clip."""
-    import time
-
-    bad, last_exc = list(expect_clips), None
-    for _ in range(retries):
-        try:
-            js = client.go2rtc_streams()
-        except FrigateError as exc:
-            last_exc = exc
-            time.sleep(delay)
-            continue
-        bad = [s for s, clip in expect_clips.items() if clip in _stream_blob(js, s)]
-        if not bad:
-            return True, []
-        time.sleep(delay)
-    if last_exc is not None:
-        log.warning("go2rtc verification degraded: %s", last_exc)
-    return False, bad
+    return _verify_clips(client, expect_clips, False, retries, delay)

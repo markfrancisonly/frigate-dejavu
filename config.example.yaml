@@ -3,44 +3,46 @@
 #
 # Copy this to `config.yaml` (gitignored) and adjust. Defaults are sensible; for
 # most setups you only touch two things:
-#   • frigate.* URLs — only if your Frigate container isn't named `frigate`
+#   • frigate.* URLs — how this container reaches Frigate
 #   • profiles.*     — your camera names (the lists below are placeholders)
+# String values may reference Compose variables as `{DEJAVU_NAME}`.
 # Everything under `capture:` is tuning. See SPEC.md §11 for the full reference.
 # ─────────────────────────────────────────────────────────────────────────────
 
 frigate:
-  api_url: http://frigate:5000          # Frigate internal (unauthenticated) API
-  go2rtc_api_url: http://frigate:1984   # embedded go2rtc API (verification)
-  restream_url: rtsp://frigate:8554     # capture source (go2rtc restream)
-  health_timeout_seconds: 300           # tensorrt cold boots have taken ~3min; the
-                                        # gate extends rather than panics on expiry
-  settle_timeout_seconds: 240           # before sourcing from recordings, wait for
-                                        # frigate's export API to answer — it lags
-                                        # /api/version by minutes after a restart
-  api_auth:                             # optional — only when api_url targets Frigate's
-    token: ""                           #   authenticated port (8971). Bearer token wins;
-    user: ""                            #   else user/password logs in via /api/login and
-    password: ""                        #   rides the JWT cookie (env overrides:
-                                        #   DEJAVU_FRIGATE_TOKEN / _USER / _PASSWORD)
+  api_url: http://frigate:5000            # Frigate internal (unauthenticated) API
+  go2rtc_api_url: http://frigate:1984     # embedded go2rtc API (verification)
+  restream_url: rtsp://frigate:8554       # capture source (go2rtc restream)
+  health_timeout_seconds: 300             # tensorrt cold boots have taken ~3min; the
+                                          # gate extends rather than panics on expiry
+  settle_timeout_seconds: 240             # before sourcing from recordings, wait for
+                                          # frigate's export API to answer — it lags
+                                          # /api/version by minutes after a restart
+  api_auth:                               # optional — only when api_url targets Frigate's
+    token: "{DEJAVU_FRIGATE_TOKEN}"       #   authenticated port (8971). Token wins;
+    user: "{DEJAVU_FRIGATE_USER}"         #   otherwise user/password logs in via
+    password: "{DEJAVU_FRIGATE_PASSWORD}" #   /api/login and rides the JWT cookie
 
 # Container-internal paths — these pair with the volume mounts in compose.yaml;
 # leave them unless you changed the right-hand (container) side of a mount there.
 paths:
-  clips_local: /clips                   # this container's view of the clips dir
+  clips_local: /clips               # this container's view of the clips dir
   clips_frigate: /config/dejavu-clips  # the same dir as frigate/go2rtc sees it
-  recordings_dir: /recordings           # frigate's segment files (ro mount) — clip
-                                        #   sourcing reads these directly; export API
-                                        #   retries missing/unreadable candidates and
-                                        #   failed direct assembly automatically
+  recordings_dir: /recordings       # frigate's segment files (ro mount) — clip
+                                    #   sourcing reads these directly; export API
+                                    #   retries missing/unreadable candidates and
+                                    #   failed direct assembly automatically
   state_dir: /data/state
   tmp_dir: /data/tmp
 
 capture:
-  # With the production recordings source, each stream first gets a safe freeze
-  # fallback. Loop searches run in parallel and successful clips are atomically
-  # promoted before one coordinated Frigate restart. A stream is NEVER left
-  # live: if no suitable loop is found, its freeze frame is used. The opt-in
-  # restream loop source directly captures live video and aborts if capture fails.
+  # With the production recordings source, privacy engages in TWO stages: every
+  # stream first goes ON with a safe freeze frame via one coordinated Frigate
+  # restart (prompt, guaranteed), then loops are assembled in the background and
+  # swapped in via a second restart (bounded by loop_assembly_budget_seconds). A
+  # stream is NEVER left live; one that never finds a loop stays frozen forever —
+  # a success, not a failure. The opt-in restream loop source directly captures
+  # live video and aborts if capture fails.
   source: recordings          # recordings (loop search sourced from Frigate's own
                               #   recordings) | restream (loop from a live capture)
   seconds: 300                # target loop length. LONGER is better: a car passing
@@ -53,6 +55,11 @@ capture:
   parallel: 4                 # concurrent loop-window searches
   parallel_frames: 8          # concurrent live frame grabs for freeze fallbacks
   keep_clips_after_off: false
+  loop_assembly_budget_seconds: 900  # stage 2: once privacy is ON via freeze,
+                              #   loops assemble in the background and swap in via
+                              #   one more restart. Generous — privacy is already
+                              #   on; a stream without a loop in time stays frozen
+                              #   permanently. 0 = unbounded (still cancellable).
   recordings:
     search_hours: 4           # lookback limit for the loop search — bounded "within
                               #   reason"; the brightness guards police lighting
@@ -112,7 +119,7 @@ profiles:
     mode: loop                # loop | freeze
     cameras: []               # all cameras
 
-  # Named profiles you can trigger by name (e.g. from Home Assistant switches).
+  # Named profiles you can trigger by name (e.g. from the Home Assistant selector).
   # EDIT: replace these placeholder camera names with your Frigate camera names.
   perimeter:                  # example: outdoor cameras
     mode: loop
@@ -126,5 +133,5 @@ profiles:
 
 api:
   listen: 0.0.0.0:8898
-  bearer_token: ""            # empty = auth disabled; prefer DEJAVU_API_TOKEN env
+  bearer_token: "{DEJAVU_API_TOKEN}"  # empty = auth disabled
   debounce_seconds: 5

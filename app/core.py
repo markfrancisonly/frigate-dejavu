@@ -17,6 +17,7 @@ import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
 
 import capture as capture_mod
@@ -92,6 +93,19 @@ def pid_alive(pid):
         return True
 
 
+def _remove(path):
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+
+
+def _read_json(path, default):
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (FileNotFoundError, ValueError):
+        return default
+
+
 # --------------------------------------------------------------------------
 # persistent state
 # --------------------------------------------------------------------------
@@ -101,12 +115,9 @@ def _atomic_write(path, payload, *, binary=False):
     """Write to a temporary file, then atomically replace the destination."""
     tmp = path + ".tmp"
     try:
-        if binary:
-            with open(tmp, "wb") as handle:
-                handle.write(payload)
-        else:
-            with open(tmp, "w", encoding="utf-8") as handle:
-                handle.write(payload)
+        mode, options = ("wb", {}) if binary else ("w", {"encoding": "utf-8"})
+        with open(tmp, mode, **options) as handle:
+            handle.write(payload)
         os.replace(tmp, path)
     finally:
         with contextlib.suppress(OSError):
@@ -138,11 +149,7 @@ class StateStore:
                     fcntl.flock(f, fcntl.LOCK_UN)
 
     def read(self):
-        try:
-            with open(self.state_path) as f:
-                return json.load(f)
-        except (FileNotFoundError, ValueError):
-            return {"state": "off"}
+        return _read_json(self.state_path, {"state": "off"})
 
     def _write(self, st):
         st = dict(st)
@@ -174,19 +181,14 @@ class StateStore:
     # -- artifacts -----------------------------------------------------------
 
     def read_streams_record(self):
-        try:
-            with open(self.streams_path) as f:
-                return json.load(f)
-        except (FileNotFoundError, ValueError):
-            return None
+        return _read_json(self.streams_path, None)
 
     def write_streams_record(self, record):
         payload = json.dumps(record, indent=2, sort_keys=True)
         _atomic_write(self.streams_path, payload)
 
     def clear_streams_record(self):
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(self.streams_path)
+        _remove(self.streams_path)
 
     def write_backup(self, raw, session):
         stamped = os.path.join(self.state_dir, f"backup.{session}.yaml")
@@ -228,12 +230,23 @@ class StateStore:
 
 def reconcile_locked(store):
     """Call under store.locked(): a transitional state whose job PID is dead
-    becomes 'error' (SPEC §9)."""
+    becomes 'error' (SPEC §9). A stage-2 loop upgrade dying is NOT an error —
+    the freeze baseline stays ON permanently; only the dead upgrade_pid marker
+    is cleared so status stops showing a phantom in-progress upgrade."""
     st = store.read()
     if st.get("state") in TRANSITIONAL and not pid_alive(st.get("job_pid")):
         detail = f"job (pid {st.get('job_pid')}) died during '{st.get('state')}'"
         log.warning("reconciling stale state: %s", detail)
         st = store.mark_completed(state="error", last_error=detail)
+    elif (
+        st.get("state") == "on"
+        and st.get("upgrade_pid") is not None
+        and not pid_alive(st.get("upgrade_pid"))
+    ):
+        log.info(
+            "loop upgrade (pid %s) ended — staying ON on freeze", st.get("upgrade_pid")
+        )
+        st = store.update(upgrade_pid=None)
     return st
 
 
@@ -260,7 +273,7 @@ def preflight(cfg, op):
             if state == "on":
                 raise Busy("dejavu already on")
             if state in TRANSITIONAL:
-                raise Busy(f"busy: {state} in progress")
+                raise Busy(f"{state} in progress")
             if state == "error":
                 raise Busy(
                     "state is 'error' — run off (restore) or force-restore first"
@@ -271,7 +284,9 @@ def preflight(cfg, op):
             if state == "off":
                 return {"noop": True}
             if state in ("applying", "restoring"):
-                raise Busy(f"busy: {state} in progress — retry shortly")
+                raise Busy(f"{state} in progress — retry shortly")
+            if state == "on" and pid_alive(st.get("upgrade_pid")):
+                return {"noop": False}  # cancel the in-flight upgrade; no debounce
             if state in ("on", "error"):
                 _check_debounce(cfg, st)
             return {"noop": False}
@@ -363,8 +378,8 @@ class Job:
 
     def install_signal_handlers(self):
         def handler(signum, _frame):
-            if self.phase == "capturing":
-                log.warning("received signal %s: cancelling capture", signum)
+            if self.phase in ("capturing", "upgrading"):
+                log.warning("received signal %s: cancelling %s", signum, self.phase)
                 self.cancel.cancel()
             else:
                 log.warning(
@@ -380,8 +395,12 @@ class Job:
     # -- restart + verify (SPEC §8) ------------------------------------------
 
     def _restart(self):
+        """Ask frigate to restart; return True if it was OBSERVED going down.
+        A confirmed down->healthy cycle is what forces go2rtc to re-exec and
+        re-open the clip files (stage 2 relies on this — the clip PATH never
+        changes, so a path check alone cannot prove the swapped inode loaded)."""
         self.client.restart_api()
-        self.client.wait_down(30)
+        return self.client.wait_down(30)
 
     def _wait_healthy_or_fail(self):
         timeout = self.cfg["frigate"]["health_timeout_seconds"]
@@ -392,6 +411,11 @@ class Job:
                 "restart — restart Frigate externally, then run 'off' "
                 "or 'force-restore'"
             )
+
+    def _rollback(self):
+        if self.surgical_restore()["changed"]:
+            self._restart()
+            self._wait_healthy_or_fail()
 
     def restart_and_verify(self, expect_clips, direction):
         """Restart frigate, wait healthy, verify go2rtc picked up the change;
@@ -430,10 +454,7 @@ class Job:
                     )
                 log.error("go2rtc is not coming up — rolling back the swap")
                 try:
-                    result = self.surgical_restore()
-                    if result["changed"]:
-                        self._restart()
-                        self._wait_healthy_or_fail()
+                    self._rollback()
                 except (FrigateError, JobError) as rb_exc:
                     raise JobError(
                         "go2rtc never came up AND automatic rollback "
@@ -468,10 +489,7 @@ class Job:
                 ", ".join(bad),
             )
             try:
-                res = self.surgical_restore()
-                if res["changed"]:
-                    self._restart()
-                    self._wait_healthy_or_fail()
+                self._rollback()
             except (FrigateError, JobError) as exc:
                 raise JobError(
                     f"go2rtc did not apply dejavu sources for {', '.join(bad)} "
@@ -485,6 +503,70 @@ class Job:
             "restore verification failed — still serving dejavu clips: "
             + ", ".join(bad)
         )
+
+    def soft_restart(self, expect_clips):
+        """Stage-2 swap seam: bounce frigate so go2rtc re-opens the clip files
+        that stage 2 atomically swapped (freeze -> loop) at the SAME path. NO
+        config edit and NO rollback — the config is byte-identical for freeze and
+        loop, so a failed verify just keeps serving a private clip. Returns True
+        when the loop is live (frigate was OBSERVED restarting, so go2rtc re-opened
+        the swapped clip), False when the restart was a no-op (frigate stayed up —
+        loops are staged and load on the next restart). Raises only when frigate
+        never returns (a genuine outage), which the caller maps to 'error'; privacy
+        stays intact in every case. (When Frigate ships live config update, this is
+        the one call that becomes a fast in-place swap.)"""
+        timeout = self.cfg["frigate"]["health_timeout_seconds"]
+        log.info("restarting frigate via API (loop upgrade)...")
+        went_down = self._restart()
+        if not self.client.wait_healthy(timeout):
+            log.warning(
+                "health gate (%ss) expired — extending wait for the API...", timeout
+            )
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not self.client.is_up():
+                time.sleep(3)
+            if not self.client.is_up():
+                raise JobError(
+                    f"frigate API did not come back within {2 * timeout}s after the "
+                    "loop-upgrade restart — restart Frigate externally"
+                )
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and not self.client.go2rtc_up():
+                time.sleep(3)
+            if not self.client.go2rtc_up():
+                raise JobError(
+                    "go2rtc did not come back after the loop-upgrade restart"
+                )
+        if not went_down:
+            # /api/restart did not actually bounce frigate, so go2rtc still holds
+            # the freeze inode: the loop is NOT live. The clips are staged on disk
+            # and will load on the next restart. Do NOT claim they are serving —
+            # a path check can't tell freeze from loop (same path). Privacy intact,
+            # so this is not an error; report it so the caller notes it honestly.
+            log.warning(
+                "frigate was not observed restarting for the loop upgrade — go2rtc "
+                "may still be serving the freeze frames; the loop clips are staged "
+                "and will load on the next restart (privacy intact)"
+            )
+            return False
+        if not expect_clips:
+            return True
+        # We saw frigate go down and come back, so go2rtc re-execed and re-opened
+        # the clip path — for stage 2 that is the actual proof the loop loaded.
+        # verify_dejavu_applied is a secondary sanity check that go2rtc is serving
+        # the clip path at all (not, e.g., fallen back to a live source).
+        ok, bad = frigate_mod.verify_dejavu_applied(self.client, expect_clips)
+        if ok:
+            log.info(
+                "frigate restarted; go2rtc re-opened %d loop clip(s)", len(expect_clips)
+            )
+        else:
+            log.warning(
+                "loop upgrade restarted frigate but go2rtc is not serving the clip "
+                "path for %s — leaving as-is (privacy intact on the clip path)",
+                ", ".join(bad),
+            )
+        return True
 
     # -- surgical restore (SPEC §7.2) -----------------------------------------
 
@@ -556,12 +638,8 @@ class Job:
 # --------------------------------------------------------------------------
 
 
-def _cache_path(cfg, stream):
-    return os.path.join(cfg["paths"]["state_dir"], "lastframe", f"{stream}.png")
-
-
-def _cache_meta_path(cfg, stream):
-    return os.path.join(cfg["paths"]["state_dir"], "lastframe", f"{stream}.json")
+def _cache_path(cfg, stream, extension="png"):
+    return os.path.join(cfg["paths"]["state_dir"], "lastframe", f"{stream}.{extension}")
 
 
 _CACHE_META_FIELDS = (
@@ -587,7 +665,7 @@ def _remember_frame(cfg, stream, png, source_meta):
         # crash lands between the two replaces, stale metadata is ignored.
         payload["frame_mtime_ns"] = os.stat(dest).st_mtime_ns
         _atomic_write(
-            _cache_meta_path(cfg, stream), json.dumps(payload, sort_keys=True)
+            _cache_path(cfg, stream, "json"), json.dumps(payload, sort_keys=True)
         )
     except OSError as exc:
         log.debug("%s: could not cache frame/metadata: %s", stream, exc)
@@ -596,7 +674,7 @@ def _remember_frame(cfg, stream, png, source_meta):
 def _cached_frame_meta(cfg, stream):
     frame = _cache_path(cfg, stream)
     try:
-        with open(_cache_meta_path(cfg, stream), encoding="utf-8") as handle:
+        with open(_cache_path(cfg, stream, "json"), encoding="utf-8") as handle:
             payload = json.load(handle)
         if payload.get("frame_mtime_ns") != os.stat(frame).st_mtime_ns:
             log.debug(
@@ -625,6 +703,16 @@ def _freeze_from_png(cfg, job, stream, png, src_meta):
     }
 
 
+def _freeze_and_cache(cfg, job, stream, png, src_meta, reference=False):
+    try:
+        ref = recordings_mod.frame_stats(png, job.cancel) if reference else None
+        result = _freeze_from_png(cfg, job, stream, png, src_meta)
+        _remember_frame(cfg, stream, png, src_meta)
+        return result, ref
+    finally:
+        _remove(png)
+
+
 def _engage_freeze(cfg, req, job, store, stream, meta):
     """Rungs 1-4. Always returns a result; raises only on cancellation.
     On the live rung it also carries `ref` — the frame's lighting stats."""
@@ -642,26 +730,18 @@ def _engage_freeze(cfg, req, job, store, stream, meta):
         png, src_meta = capture_mod.frame_from_live(
             stream, url, paths["tmp_dir"], job.cancel, store.update_stream
         )
-        try:
-            ref = recordings_mod.frame_stats(png, job.cancel)
-            result = _freeze_from_png(cfg, job, stream, png, src_meta)
-            _remember_frame(cfg, stream, png, src_meta)
-            log.debug(
-                "%s: rung 1 (live) OK in %.1fs — %sx%s %s, luma=%.0f " "chroma=%.1f",
-                stream,
-                time.monotonic() - t0,
-                src_meta.get("width"),
-                src_meta.get("height"),
-                src_meta.get("video_codec"),
-                ref["luma"],
-                ref["chroma"],
-            )
-            return {**result, "clip_source": "live", "rung": "live", "ref": ref}
-        finally:
-            if os.path.exists(png):
-                os.unlink(png)
-    except Cancelled:
-        raise
+        result, ref = _freeze_and_cache(cfg, job, stream, png, src_meta, reference=True)
+        log.debug(
+            "%s: rung 1 (live) OK in %.1fs — %sx%s %s, luma=%.0f " "chroma=%.1f",
+            stream,
+            time.monotonic() - t0,
+            src_meta.get("width"),
+            src_meta.get("height"),
+            src_meta.get("video_codec"),
+            ref["luma"],
+            ref["chroma"],
+        )
+        return {**result, "clip_source": "live", "rung": "live", "ref": ref}
     except capture_mod.CaptureError as exc:
         reasons.append(f"live: {exc}")
         log.warning(
@@ -686,21 +766,14 @@ def _engage_freeze(cfg, req, job, store, stream, meta):
                 store.update_stream,
                 recordings_dir=paths["recordings_dir"],
             )
-            try:
-                result = _freeze_from_png(cfg, job, stream, png, src_meta)
-                _remember_frame(cfg, stream, png, src_meta)
-                return {
-                    **result,
-                    "clip_source": "recordings",
-                    "rung": "recorded",
-                    "window": window,
-                    "ref": None,
-                }
-            finally:
-                if os.path.exists(png):
-                    os.unlink(png)
-        except Cancelled:
-            raise
+            result, _ = _freeze_and_cache(cfg, job, stream, png, src_meta)
+            return {
+                **result,
+                "clip_source": "recordings",
+                "rung": "recorded",
+                "window": window,
+                "ref": None,
+            }
         except capture_mod.CaptureError as exc:
             reasons.append(f"recordings: {exc}")
 
@@ -726,8 +799,6 @@ def _engage_freeze(cfg, req, job, store, stream, meta):
                 "ref": None,
                 "degraded": "; ".join(reasons),
             }
-        except Cancelled:
-            raise
         except capture_mod.CaptureError as exc:
             reasons.append(f"cache: {exc}")
 
@@ -785,10 +856,11 @@ def _make_freeze_task(cfg, req, job, store, stream, meta):
     return task
 
 
-def _make_upgrade_task(cfg, req, job, store, stream, meta, ref, want_audio):
+def _make_upgrade_task(cfg, req, job, store, stream, meta, ref, want_audio, cancel):
     """Stage a loop from this stream's recent past for atomic promotion.
 
-    Returns None when nothing beats the freeze frame.
+    Returns None when nothing beats the freeze frame. `cancel` bounds the search
+    so it can be abandoned at the deadline without aborting the activation.
     """
     cap, paths = cfg["capture"], cfg["paths"]
     rcfg = cap["recordings"]
@@ -812,7 +884,7 @@ def _make_upgrade_task(cfg, req, job, store, stream, meta, ref, want_audio):
                 paths["tmp_dir"],
                 req["seconds"],
                 rcfg,
-                job.cancel,
+                cancel,
                 store.update_stream,
                 candidates=candidates,
                 recordings_dir=paths["recordings_dir"],
@@ -820,10 +892,9 @@ def _make_upgrade_task(cfg, req, job, store, stream, meta, ref, want_audio):
                 max_seconds=cap["max_loop_seconds"],
                 want_audio=want_audio,
                 out_path=part,
+                files_only=True,
             )
             return {**result, "clip_source": "recordings", "rung": "loop"}
-        except Cancelled:
-            raise
         except capture_mod.CaptureError as exc:
             log.info("%s: staying on the freeze frame — %s", stream, exc)
             if os.path.exists(part):
@@ -870,61 +941,125 @@ def _log_ladder(results):
 # --------------------------------------------------------------------------
 
 
-def _start_upgrades(cfg, req, job, store, plan, engaged):
-    """Kick off one loop search per stream. The clips they produce are staged,
-    not published: promotion happens under _promote_upgrades."""
+class _AnyCancel:
+    """A cancel token that also trips when any of its source tokens does.
+
+    The loop search must still stop on the job-wide cancel (SIGTERM), yet also
+    be interruptible on its own so a deadline timer can end a slow scan WITHOUT
+    aborting the activation — the un-upgraded streams just engage on the freeze
+    clips already staged on disk. ffmpeg procs are registered on every source
+    too, so whichever token trips terminates them promptly."""
+
+    def __init__(self, *sources):
+        self._sources = sources
+        self._own = CancelToken()
+
+    @property
+    def cancelled(self):
+        return self._own.cancelled or any(s.cancelled for s in self._sources)
+
+    def check(self):
+        if self.cancelled:
+            raise Cancelled()
+
+    def register(self, proc):
+        self._own.register(proc)
+        for source in self._sources:
+            source.register(proc)
+
+    def unregister(self, proc):
+        self._own.unregister(proc)
+        for source in self._sources:
+            source.unregister(proc)
+
+    def cancel(self):
+        self._own.cancel()
+
+
+def _start_upgrades(cfg, req, job, store, plan, engaged, cancel):
+    """Stage 2: kick off one background loop search per live-rung stream. The
+    clips are staged, not published — promotion happens under _promote_upgrades.
+    Runs entirely from local recordings (NO Frigate API): the candidate windows
+    were selected before restart #1 and each stream carries its own freeze-frame
+    reference, so a stream without a carried reference (offline / black rung) is
+    simply left on its freeze clip."""
     paths = cfg["paths"]
     if not recordings_mod.files_retrieval_available(paths["recordings_dir"]):
-        # export retrieval only: /api/version answers minutes before the export
-        # machinery does after a restart. Freeze preparation never touches it,
-        # so this gate delays activation but remains cancellable because config
-        # is untouched.
-        api = cfg["frigate"]["api_url"].rstrip("/")
-        if not recordings_mod.wait_exports_ready(
-            api, cfg["frigate"]["settle_timeout_seconds"], job.cancel
-        ):
-            log.warning(
-                "frigate export API never settled — no recordings loop search "
-                "this session; streams will use their freeze fallbacks"
-            )
-            return None, {}
-    else:
-        log.info("retrieval: direct segment reads from %s", paths["recordings_dir"])
+        # Direct segment reads are what keep stage 2 API-free after the restart;
+        # without them the only source is the export API, which lags minutes
+        # post-restart. Skip the upgrade and keep the freeze baseline.
+        log.info(
+            "recordings not directly readable at %s — skipping the loop upgrade; "
+            "streams stay on their freeze frames",
+            paths["recordings_dir"],
+        )
+        return None, {}
+    log.info("retrieval: direct segment reads from %s", paths["recordings_dir"])
 
-    _plan_synced_windows(cfg, req, plan)
     pool = ThreadPoolExecutor(
         max_workers=max(1, cfg["capture"]["parallel"]), thread_name_prefix="upgrade"
     )
     futures = {}
     for stream, meta in plan.items():
         r = engaged.get(stream)
-        if not r:
-            continue
+        if not r or r.get("ref") is None:
+            continue  # offline / black rung: no live reference, stays on freeze
         task = _make_upgrade_task(
-            cfg, req, job, store, stream, meta, r.get("ref"), r["has_audio"]
+            cfg, req, job, store, stream, meta, r.get("ref"), r["has_audio"], cancel
         )
         futures[stream] = pool.submit(task)
     log.info(
-        "searching for loop windows on %d stream(s) before activation", len(futures)
+        "searching for loop windows on %d stream(s) in the background", len(futures)
     )
     return pool, futures
 
 
-def _collect_upgrades(futures, allowed):
-    """Wait for every parallel loop search and harvest successful candidates."""
+_COLLECT_GRACE_SECONDS = 15  # let a cancelled search wind down before abandoning it
+
+
+def _collect_upgrades(futures, allowed, cancel, deadline_seconds):
+    """Harvest the loop searches, bounded by `deadline_seconds` as a WALL-CLOCK
+    budget: when it expires the timer trips `cancel` (which kills in-flight ffmpeg,
+    including any started just after — see CancelToken.register), and a straggler
+    that does not wind down within a short grace is ABANDONED rather than waited on
+    (its stream stays on the freeze clip already on disk). deadline_seconds <= 0
+    waits with no budget (searches still stop on the job cancel)."""
+    hard = None
+    timer = None
+    if deadline_seconds and deadline_seconds > 0:
+        hard = time.monotonic() + deadline_seconds + _COLLECT_GRACE_SECONDS
+        timer = threading.Timer(deadline_seconds, cancel.cancel)
+        timer.daemon = True
+        timer.start()
     upgrades = {}
-    for stream, fut in futures.items():
-        try:
-            result = fut.result()
-        except Cancelled:
-            continue
-        except Exception as exc:  # noqa: BLE001 — an upgrade never fails the job
-            log.warning(
-                "%s: loop search failed (%s) — staying on the freeze frame", stream, exc
-            )
-            continue
-        if result and stream in allowed:
-            upgrades[stream] = result
+    try:
+        for stream, fut in futures.items():
+            remaining = None if hard is None else max(0.0, hard - time.monotonic())
+            try:
+                result = fut.result(timeout=remaining)
+            except FuturesTimeout:
+                # Past the budget + grace and still running: don't block on it —
+                # abandon it (cancel already fired, killing its ffmpeg); the
+                # stream stays on freeze.
+                log.warning(
+                    "%s: loop search ran past the budget — abandoned; stays on freeze",
+                    stream,
+                )
+                continue
+            except Cancelled:
+                continue
+            except Exception as exc:  # noqa: BLE001 — an upgrade never fails the job
+                log.warning(
+                    "%s: loop search failed (%s) — staying on the freeze frame",
+                    stream,
+                    exc,
+                )
+                continue
+            if result and stream in allowed:
+                upgrades[stream] = result
+    finally:
+        if timer is not None:
+            timer.cancel()
     return upgrades
 
 
@@ -1030,6 +1165,131 @@ def _plan_synced_windows(cfg, req, plan):
     return anchor
 
 
+def _run_loop_upgrade(cfg, job, req, plan, engaged, record, replacements, session):
+    """Stage 2 (best-effort): assemble loops in the background and swap them in
+    via one bare restart. Privacy is ALREADY guaranteed on freeze, so this only
+    ever upgrades a private freeze to a private loop and NEVER raises — every
+    failure leaves the freeze baseline standing. A concurrent 'off' flips the
+    state out from under the ownership gate, so this promotes/restarts nothing
+    and exits, letting 'off' win."""
+    store = job.store
+    mypid = os.getpid()
+    search_cancel = _AnyCancel(job.cancel)
+    pool = None
+    try:
+        budget = cfg["capture"]["loop_assembly_budget_seconds"]
+        pool, futures = _start_upgrades(
+            cfg, req, job, store, plan, engaged, search_cancel
+        )
+        if not futures:
+            return  # offline-only, or recordings not directly readable
+        log.info(
+            "stage 2: assembling loops in the background (budget %s); privacy is "
+            "already ON via freeze",
+            f"{budget}s" if budget else "unbounded",
+        )
+        upgrades = _collect_upgrades(futures, replacements, search_cancel, budget)
+
+        # Promote + claim the restart under the lock, ownership-gated so a
+        # concurrent 'off' (which flips state to 'restoring') always wins: it
+        # either lands before this block (we see state != on and drop) or after
+        # (we claim 'applying', and it gets 'retry shortly' until we settle).
+        with store.locked():
+            st = store.read()
+            owned = (
+                st.get("state") == "on"
+                and st.get("upgrade_pid") == mypid
+                and st.get("session") == session
+            )
+            # Drop only on a lost ownership race or a REAL abort (off / SIGTERM,
+            # via job.cancel) — NOT on plain budget expiry, which trips
+            # search_cancel's own timer channel; loops that finished in time still
+            # ship. (search_cancel.cancelled would be True on every budget expiry.)
+            if not owned or job.cancel.cancelled:
+                log.info(
+                    "stage 2: superseded or cancelled — dropping the loop upgrade; "
+                    "the freeze baseline stands"
+                )
+                return
+            promoted = _promote_upgrades(upgrades, record) if upgrades else []
+            # settle every replaced stream's phase (clear any stale 'searching…')
+            streams = st.get("streams") or {}
+            for s, rec in record.items():
+                if s in streams:
+                    streams[s]["phase"] = _stream_phase(rec)
+            if not promoted:
+                # settle phases now; the finally clears upgrade_pid AND rewrites
+                # the stale 'upgrading' note to a truthful 'on freeze'.
+                store.update(streams=streams)
+                log.info(
+                    "stage 2: no stream produced a loop within budget — %d "
+                    "stream(s) stay on freeze permanently",
+                    len(replacements),
+                )
+                return
+            store.write_streams_record(
+                {"session": session, "created_at": now_iso(), "streams": record}
+            )
+            # Claim the brief restart window as a transitional state so a crash
+            # mid-restart reconciles to 'error' and 'off' gets 'retry shortly'.
+            store.update(
+                state="applying",
+                job_pid=mypid,
+                upgrade_pid=None,
+                streams=streams,
+                note="restart=frigate-api; loop upgrade",
+            )
+            job.phase = "restarting"
+
+        log.info("stage 2: swapping in %d loop(s) via one restart", len(promoted))
+        try:
+            live = job.soft_restart({s: frigate_mod.clip_name(s) for s in promoted})
+        except (JobError, FrigateError) as exc:
+            log.error(
+                "stage 2: loop-upgrade restart did not come healthy (%s) — the "
+                "dejavu config is intact and private, but Frigate needs attention",
+                exc,
+            )
+            with store.locked():
+                store.mark_completed(state="error", last_error=str(exc))
+            return
+        # `live` False => the restart was a no-op; loops are staged but go2rtc is
+        # still serving freeze (both private). Record it honestly rather than
+        # claiming loops are on air.
+        note = (
+            "restart=frigate-api; loops"
+            if live
+            else "restart=frigate-api; loops staged (restart no-op — load next restart)"
+        )
+        with store.locked():
+            store.mark_completed(state="on", last_error=None, note=note)
+        log.info(
+            "stage 2: %d stream(s) %s",
+            len(promoted),
+            "upgraded to loops" if live else "staged (loops load on the next restart)",
+        )
+    except Cancelled:
+        log.info("stage 2 cancelled — freeze frames stand, dejavu intact")
+    except Exception:  # noqa: BLE001 — a loop upgrade must never break privacy
+        log.exception("stage 2 failed — freeze frames stand, dejavu intact")
+    finally:
+        if pool is not None:
+            search_cancel.cancel()
+            pool.shutdown(wait=False)
+            store.cleanup_upgrade_parts()
+        # If we bailed before finalizing and still own the marker, clear it so
+        # status stops showing a phantom in-progress upgrade. Suppressed: this
+        # runs in the finally of the function that must NEVER raise (a raise here
+        # would reach cmd_on and wrongly flip a private freeze to state=error; a
+        # leftover marker is harmless — reconcile clears it next command).
+        with contextlib.suppress(Exception), store.locked():
+            st = store.read()
+            if st.get("state") == "on" and st.get("upgrade_pid") == mypid:
+                # bailed before promoting loops (no futures / no loop / error):
+                # clear the marker AND replace the stale 'upgrading' note.
+                store.update(upgrade_pid=None, note="restart=frigate-api; on freeze")
+
+
 def cmd_on(
     cfg,
     profile=None,
@@ -1057,7 +1317,7 @@ def cmd_on(
         if state == "on":
             raise Busy("dejavu already on — run 'off' first")
         if state in TRANSITIONAL:
-            raise Busy(f"busy: {state} in progress")
+            raise Busy(f"{state} in progress")
         if state == "error":
             raise Busy(
                 "state is 'error' — run 'off' (restore) or 'force-restore' first"
@@ -1088,7 +1348,6 @@ def cmd_on(
     )
 
     config_touched = False
-    pool = None  # loop-search pool; the finally reaps it on every exit
     try:
         raw, y, data, plan, notes = build_plan(cfg, job.client, req)
         _log_notes(notes)
@@ -1143,20 +1402,18 @@ def cmd_on(
             )
         _log_ladder(ok)
 
-        # Search for loop candidates before touching Frigate's config. Searches
-        # still run in parallel; a failed search leaves that stream on its
-        # already-prepared freeze clip. This remains cancellable.
-        upgrades, futures = {}, {}
+        # Two-stage engage. Stage 1 goes ON with freeze frames (below); stage 2
+        # upgrades them to loops in the background afterward. The loop-WINDOW
+        # selection is the only API-dependent step, so do it here — Frigate is up
+        # and cameras are live — and stash the candidates on `plan`; stage 2 then
+        # assembles purely from local recordings after the restart.
         want_loops = (
             req["mode"] == "loop"
             and req["source"] == "recordings"
             and not job.cancel.cancelled
         )
         if want_loops:
-            pool, futures = _start_upgrades(cfg, req, job, store, plan, ok)
-            want_loops = bool(futures)  # nothing to search (no cameras / no export)
-            if want_loops:
-                upgrades = _collect_upgrades(futures, ok)
+            _plan_synced_windows(cfg, req, plan)
 
         # From this boundary onward the persisted config may change, so signals
         # are ignored and the transition must run through restart/verification.
@@ -1217,23 +1474,6 @@ def cmd_on(
         if not replacements:
             raise JobError("no capturable streams left to replace")
 
-        if upgrades:
-            promoted = _promote_upgrades(
-                {s: result for s, result in upgrades.items() if s in replacements},
-                record,
-            )
-            log.info(
-                "loop search completed before activation (%d/%d promoted)",
-                len(promoted),
-                len(replacements),
-            )
-        elif want_loops:
-            log.info("no stream found a suitable loop; using freeze frames")
-        if pool is not None:
-            pool.shutdown(wait=True)
-            store.cleanup_upgrade_parts()
-            pool = None
-
         frigate_mod.apply_dejavu(data2, replacements)
         new_raw = frigate_mod.dump_config(y2, data2)
         store.write_streams_record(
@@ -1250,19 +1490,41 @@ def cmd_on(
         expect = {s: frigate_mod.clip_name(s) for s in replacements}
         job.restart_and_verify(expect, direction="on")
 
+        # Enter the cancellable 'upgrading' phase BEFORE publishing state='on' +
+        # upgrade_pid below, so an 'off' that arrives the instant state becomes
+        # 'on' has its SIGTERM honored (the handler only cancels while phase is
+        # capturing/upgrading). restart #1 above ran in the non-cancellable
+        # 'applying' phase, which is correct — a restart runs to completion.
+        if want_loops:
+            job.phase = "upgrading"
+
+        # Stage 1 done: privacy is ON via freeze — a GUARANTEED, PERMANENT
+        # baseline. Mark it WITHOUT finalizing: job_pid stays None (so a stage-2
+        # death reconciles to a safe 'on', never 'error'), and upgrade_pid marks
+        # the live upgrade so a concurrent 'off' can find and cancel it.
         stream_status = {
             s: {"phase": _stream_phase(record[s]), "cameras": record[s]["cameras"]}
             for s in replacements
         }
         with store.locked():
-            store.mark_completed(
+            store.update(
                 state="on",
+                job_pid=None,
+                upgrade_pid=os.getpid() if want_loops else None,
                 streams=stream_status,
                 last_error=None,
-                note="restart=frigate-api",
+                last_completed_at=now_iso(),
+                last_completed_ts=time.time(),
+                note=(
+                    "restart=frigate-api; upgrading"
+                    if want_loops
+                    else "restart=frigate-api"
+                ),
             )
         log.info(
-            "dejavu is ON after coordinated restart (%d stream(s))", len(replacements)
+            "dejavu is ON via freeze after coordinated restart (%d stream(s))%s",
+            len(replacements),
+            "; assembling loops in the background" if want_loops else "",
         )
         for s in sorted(replacements):
             rec = record[s]
@@ -1279,6 +1541,12 @@ def cmd_on(
                 rec["clip_source"],
                 detail,
             )
+
+        # Stage 2 (best-effort): upgrade freeze -> loop in the background. It
+        # NEVER raises — any failure leaves the permanent freeze baseline intact.
+        # (job.phase is already 'upgrading', set before the interim ON write.)
+        if want_loops:
+            _run_loop_upgrade(cfg, job, req, plan, ok, record, replacements, session)
         return 0
 
     except Cancelled:
@@ -1305,25 +1573,14 @@ def cmd_on(
         log.exception("unexpected failure during 'on'")
         _fail_job(store, config_touched, exc)
         raise JobError(f"unexpected: {exc}") from exc
-    finally:
-        # A pool still set here means an error fired after loop searches launched
-        # (success paths clear it). Its worker threads are non-daemon
-        # and would block interpreter exit on in-flight ffmpeg searches; cancel
-        # (terminates the registered procs) and shut down without waiting.
-        if pool is not None:
-            job.cancel.cancel()
-            pool.shutdown(wait=False)
-            store.cleanup_upgrade_parts()
 
 
 def _fail_job(store, config_touched, exc):
     with store.locked():
-        if config_touched:
-            # frigate config was modified; needs operator attention (off/force-restore)
-            store.mark_completed(state="error", last_error=str(exc))
-        else:
-            # nothing persisted; clips kept for inspection (SPEC §6.6)
-            store.mark_completed(state="off", last_error=str(exc))
+        # Persisted config needs restoration; otherwise clips remain only for inspection.
+        store.mark_completed(
+            state="error" if config_touched else "off", last_error=str(exc)
+        )
 
 
 def cmd_off(cfg):
@@ -1337,7 +1594,8 @@ def cmd_off(cfg):
             log.info("dejavu already off")
             return 0
         if state in ("applying", "restoring"):
-            raise Busy(f"busy: {state} in progress — retry shortly")
+            raise Busy(f"{state} in progress — retry shortly")
+        await_upgrade = None
         if state == "capturing":
             pid = st.get("job_pid")
             log.info("cancelling in-flight capture (job pid %s)", pid)
@@ -1346,6 +1604,19 @@ def cmd_off(cfg):
             except (ProcessLookupError, TypeError, ValueError):
                 pass  # next reconcile turns it into 'error'
             cancelling = True
+        elif state == "on" and pid_alive(st.get("upgrade_pid")):
+            # A stage-2 loop upgrade is running. Claiming the restore transition
+            # NOW makes its ownership gate fail (so it promotes/restarts nothing),
+            # and the SIGTERM kills its in-flight ffmpeg promptly. No debounce —
+            # 'off' must win right away.
+            await_upgrade = st.get("upgrade_pid")
+            log.info("cancelling in-flight loop upgrade (pid %s)", await_upgrade)
+            try:
+                os.kill(int(await_upgrade), signal.SIGTERM)
+            except (ProcessLookupError, TypeError, ValueError):
+                pass
+            store.update(state="restoring", job_pid=os.getpid(), upgrade_pid=None)
+            cancelling = False
         else:  # on / error
             _check_debounce(cfg, st)
             store.update(state="restoring", job_pid=os.getpid())
@@ -1370,6 +1641,21 @@ def cmd_off(cfg):
                 raise JobError(f"cancel raced completion; state is now {state!r}")
         raise JobError("cancel timed out waiting for the capture job to exit")
 
+    if await_upgrade is not None:
+        # We already hold the restore transition (state=restoring), which the
+        # upgrade's ownership gate honors — it will not touch Frigate or clips.
+        # Wait for its process to exit so its ffmpeg/pool is gone before we
+        # restart, then restore regardless.
+        deadline = time.monotonic() + 90
+        while pid_alive(await_upgrade) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        if pid_alive(await_upgrade):
+            log.warning(
+                "loop upgrade (pid %s) still alive after 90s — restoring anyway "
+                "(its ownership gate makes it a no-op)",
+                await_upgrade,
+            )
+
     job.phase = "restoring"
     job.install_signal_handlers()
     try:
@@ -1377,13 +1663,9 @@ def cmd_off(cfg):
         expect = {s: frigate_mod.clip_name(s) for s in (record.get("streams") or {})}
         result = job.surgical_restore()  # config/persistence layer (template stays)
 
-        restarted = False
-        if expect:
+        restarted = bool(expect or result["changed"])
+        if restarted:
             job.restart_and_verify(expect, direction="off")
-            restarted = True
-        elif result["changed"]:
-            job.restart_and_verify({}, direction="off")
-            restarted = True
         else:
             log.info("config already clean — nothing to restore")
 
@@ -1446,11 +1728,23 @@ def cmd_force_restore(cfg):
         if state == "capturing":
             raise Busy("capture in progress — run 'off' (cancel) first")
         if state in ("applying", "restoring"):
-            raise Busy(f"busy: {state} in progress")
+            raise Busy(f"{state} in progress")
         backup = store.read_backup()
         if backup is None:
             raise Invalid("no pristine backup on record (state/backup.current.yaml)")
-        store.update(state="restoring", job_pid=os.getpid())
+        upgrade_pid = st.get("upgrade_pid") if state == "on" else None
+        if pid_alive(upgrade_pid):
+            log.info("cancelling in-flight loop upgrade (pid %s)", upgrade_pid)
+            try:
+                os.kill(int(upgrade_pid), signal.SIGTERM)
+            except (ProcessLookupError, TypeError, ValueError):
+                pass
+        store.update(state="restoring", job_pid=os.getpid(), upgrade_pid=None)
+
+    if pid_alive(upgrade_pid):
+        deadline = time.monotonic() + 90
+        while pid_alive(upgrade_pid) and time.monotonic() < deadline:
+            time.sleep(0.5)
 
     job.phase = "restoring"
     job.install_signal_handlers()
@@ -1493,17 +1787,23 @@ def get_status(cfg, live=True):
         st = reconcile_locked(store)
 
     snapshot = {
-        "state": st.get("state", "off"),
-        "profile": st.get("profile"),
-        "mode": st.get("mode"),
-        "since": st.get("since"),
-        "session": st.get("session"),
-        "capture_seconds": st.get("capture_seconds"),
-        "streams": st.get("streams") or {},
-        "last_error": st.get("last_error"),
-        "note": st.get("note"),
-        "drift_detected": False,
+        key: st.get(key)
+        for key in (
+            "profile",
+            "mode",
+            "since",
+            "session",
+            "capture_seconds",
+            "last_error",
+            "note",
+        )
     }
+    snapshot.update(
+        state=st.get("state", "off"),
+        streams=st.get("streams") or {},
+        upgrading=bool(st.get("upgrade_pid")),
+        drift_detected=False,
+    )
 
     if live:
         client = FrigateClient(cfg)

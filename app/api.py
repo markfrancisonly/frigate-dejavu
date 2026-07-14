@@ -6,8 +6,8 @@ state file (for correct 409/400s), then spawn `dejavu` detached — the CLI
 process owns the transition and re-checks under the same flock. Answers always
 come from the state file.
 
-Auth: iff a bearer token is configured (DEJAVU_API_TOKEN env or
-api.bearer_token), every /api/* request must send it; /healthz is open.
+Auth: iff api.bearer_token resolves to a value, every /api/* request must send
+it; /healthz is open.
 """
 
 import logging
@@ -79,26 +79,24 @@ def _busy(exc):
     return jsonify(body), 409
 
 
+def _bad(message, **details):
+    return jsonify(error=message, **details), 400
+
+
 @app.post("/api/dejavu/on")
 def dejavu_on():
     # An empty POST intentionally means "use the default profile" (all cameras
     # in the reference config). Once a body is supplied, require a valid JSON
     # object so a typo cannot silently broaden the request to that default.
     raw_body = request.get_data(cache=True)
-    if not raw_body:
-        body = {}
-    else:
-        if not request.is_json:
-            return jsonify({"error": "request body must be a JSON object"}), 400
-        body = request.get_json(silent=True)
-        if not isinstance(body, dict):
-            return jsonify({"error": "request body must be a JSON object"}), 400
+    body = {}
+    if raw_body:
+        body = request.get_json(silent=True) if request.is_json else None
+    if not isinstance(body, dict):
+        return _bad("request body must be a JSON object")
     unknown = sorted(set(body) - _ON_FIELDS)
     if unknown:
-        return (
-            jsonify({"error": "unknown request field(s): " + ", ".join(unknown)}),
-            400,
-        )
+        return _bad("unknown request field(s): " + ", ".join(unknown))
 
     profile = body.get("profile")
     mode = body.get("mode")
@@ -109,59 +107,48 @@ def dejavu_on():
     if profile is not None and (
         not isinstance(profile, str) or profile not in CFG["profiles"]
     ):
-        return (
-            jsonify(
-                {
-                    "error": f"unknown profile {profile!r}",
-                    "profiles": sorted(CFG["profiles"]),
-                }
-            ),
-            400,
-        )
-    if mode is not None and mode not in ("loop", "freeze"):
-        return jsonify({"error": "mode must be 'loop' or 'freeze'"}), 400
-    if source is not None and source not in ("recordings", "restream"):
-        return jsonify({"error": "source must be 'recordings' or 'restream'"}), 400
+        return _bad(f"unknown profile {profile!r}", profiles=sorted(CFG["profiles"]))
+    for name, value, choices in (
+        ("mode", mode, ("loop", "freeze")),
+        ("source", source, ("recordings", "restream")),
+    ):
+        if value is not None and value not in choices:
+            return _bad(f"{name} must be one of: {', '.join(choices)}")
     if isinstance(cameras, str):
-        if not cameras.strip():
-            return jsonify({"error": "cameras must not be blank; use [] for all"}), 400
         cameras = [c.strip() for c in cameras.split(",")]
     if cameras is not None:
         if not isinstance(cameras, list) or not all(
             isinstance(c, str) for c in cameras
         ):
-            return jsonify({"error": "cameras must be a list of strings"}), 400
+            return _bad("cameras must be a list of strings")
         cameras = [c.strip() for c in cameras]
         if any(not c for c in cameras):
-            return (
-                jsonify({"error": "camera names must not be blank; use [] for all"}),
-                400,
-            )
+            return _bad("camera names must not be blank; use [] for all")
     if capture_seconds is not None and (
         not isinstance(capture_seconds, int)
         or isinstance(capture_seconds, bool)
         or capture_seconds < 1
     ):
-        return jsonify({"error": "capture_seconds must be a positive integer"}), 400
+        return _bad("capture_seconds must be a positive integer")
 
     try:
         core.preflight(CFG, "on")
     except Busy as exc:
         return _busy(exc)
     except Invalid as exc:
-        return jsonify({"error": str(exc)}), 400
+        return _bad(str(exc))
 
     args = ["on"]
-    if profile:
-        args += ["--profile", profile]
-    if mode:
-        args += ["--mode", mode]
-    if cameras is not None:
-        args += ["--cameras", ",".join(cameras)]
-    if capture_seconds is not None:
-        args += ["--capture-seconds", str(capture_seconds)]
-    if source:
-        args += ["--source", source]
+    options = {
+        "profile": profile,
+        "mode": mode,
+        "cameras": cameras,
+        "capture-seconds": capture_seconds,
+        "source": source,
+    }
+    for flag, value in options.items():
+        if value is not None:
+            args += [f"--{flag}", ",".join(value) if flag == "cameras" else str(value)]
     _spawn(args, "on")
     return (
         jsonify(

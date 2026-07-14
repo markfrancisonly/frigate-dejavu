@@ -27,17 +27,11 @@ import os
 import shutil
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timezone
 
 import requests
-from capture import (
-    FFMPEG_BASE,
-    Cancelled,
-    CaptureError,
-    _run,
-    probe_file,
-    summarize_probe,
-)
+from capture import FFMPEG_BASE, CaptureError, _run, probe_file, summarize_probe
 from frigate import http_delete, http_get, http_post
 
 log = logging.getLogger("dejavu.recordings")
@@ -66,6 +60,11 @@ SETTLE_RESTAT_DELAY = 0.35  # size must be unchanged across this gap
 # exports wedges the worker and even the /api/exports listing (verified live
 # with 7 parallel jobs). All export lifecycles are serialized through here.
 _EXPORT_LOCK = threading.Semaphore(1)
+
+
+def _remove(path):
+    if path and os.path.exists(path):
+        os.unlink(path)
 
 
 def _get(api, path, params=None, timeout=30):
@@ -482,16 +481,11 @@ def _fetch_window_via_files(
 
 
 # --------------------------------------------------------------------------
-# export lifecycle (IDs are diffed so pre-existing user exports are never touched)
+# export lifecycle (Frigate returns the exact ID; never infer it from shared state)
 # --------------------------------------------------------------------------
 
 
-def _export_ids(api):
-    return {e.get("id") for e in _get(api, "/api/exports").json() or []}
-
-
-def start_export(api, camera, start, end, cancel):
-    before_ids = _export_ids(api)
+def start_export(api, camera, start, end):
     try:
         r = http_post(
             f"{api}/api/export/{camera}/start/{start:.3f}/end/{end:.3f}",
@@ -506,16 +500,33 @@ def start_export(api, camera, start, end, cancel):
         raise CaptureError(f"export request failed: {exc}") from exc
     if r.status_code not in (200, 201):
         raise CaptureError(f"export rejected: HTTP {r.status_code}: {r.text[:200]}")
+    try:
+        export_id = r.json().get("export_id")
+    except (AttributeError, ValueError):
+        export_id = None
+    if not export_id:
+        raise CaptureError("export response did not include export_id")
+    return export_id
 
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if cancel:
-            cancel.check()
-        new = _export_ids(api) - before_ids
-        if new:
-            return new.pop()
-        time.sleep(0.5)
-    raise CaptureError("export did not appear in /api/exports within 30s")
+
+def _get_export(api, export_id, timeout=30):
+    try:
+        r = http_get(f"{api}/api/exports/{export_id}", timeout=timeout)
+    except requests.RequestException as exc:
+        raise CaptureError(f"export status request failed: {exc}") from exc
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        raise CaptureError(
+            f"export status failed: HTTP {r.status_code}: {r.text[:200]}"
+        )
+    try:
+        entry = r.json()
+    except ValueError as exc:
+        raise CaptureError("export status returned non-JSON") from exc
+    if not isinstance(entry, dict):
+        raise CaptureError("export status returned an invalid entry")
+    return entry
 
 
 def wait_export(api, export_id, cancel):
@@ -523,17 +534,8 @@ def wait_export(api, export_id, cancel):
     while time.monotonic() < deadline:
         if cancel:
             cancel.check()
-        entry = next(
-            (
-                e
-                for e in _get(api, "/api/exports").json() or []
-                if e.get("id") == export_id
-            ),
-            None,
-        )
-        if entry is None:
-            raise CaptureError("export vanished while waiting")
-        if not entry.get("in_progress"):
+        entry = _get_export(api, export_id)
+        if entry is not None and not entry.get("in_progress"):
             return entry
         time.sleep(1)
     raise CaptureError(f"export not finished after {EXPORT_TIMEOUT}s")
@@ -559,27 +561,13 @@ def download_export(api, entry, dest, cancel):
 
 
 def delete_export(api, export_id):
-    """Delete our export and verify it actually leaves the list (frigate
-    removes entries asynchronously)."""
+    """Delete the exact export returned by Frigate."""
     try:
         r = http_delete(f"{api}/api/export/{export_id}", timeout=15)
         if r.status_code not in (200, 204, 404):
             log.warning("could not delete export %s: HTTP %s", export_id, r.status_code)
-            return
     except requests.RequestException as exc:
         log.warning("could not delete export %s: %s", export_id, exc)
-        return
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        try:
-            if export_id not in _export_ids(api):
-                return
-        except CaptureError:
-            return  # can't list; nothing more to do
-        time.sleep(0.5)
-    log.warning(
-        "export %s still listed 10s after delete — check Frigate's export UI", export_id
-    )
 
 
 # --------------------------------------------------------------------------
@@ -902,8 +890,6 @@ def _fetch_window_clip(
             return _fetch_window_via_files(
                 recordings_dir, camera, stream, win, tmp_dir, cancel, progress, now
             )
-        except Cancelled:
-            raise
         except CaptureError as exc:
             log.warning(
                 "%s: direct segment read failed (%s) — using export API", stream, exc
@@ -913,7 +899,7 @@ def _fetch_window_clip(
         if cancel:
             cancel.check()
         progress(stream, f"exporting {describe_window(win, now)}")
-        export_id = start_export(api, camera, win["start"], win["end"], cancel)
+        export_id = start_export(api, camera, win["start"], win["end"])
         tmp_clip = os.path.join(tmp_dir, f"{stream}.export.mp4")
         try:
             entry = wait_export(api, export_id, cancel)
@@ -1114,12 +1100,10 @@ def screen_window_files(
 
 
 def _rejection_summary(rejections):
-    """Group per-candidate rejection reasons into 'reason ×N' counts — ONE
-    operator-log line instead of one per candidate (full detail is at DEBUG)."""
-    counts = {}
-    for reason in rejections:
-        counts[reason] = counts.get(reason, 0) + 1
-    return ", ".join(f"{r} ×{n}" if n > 1 else r for r, n in counts.items())
+    """Group repeated reasons into one operator-log summary."""
+    return ", ".join(
+        f"{r} ×{n}" if n > 1 else r for r, n in Counter(rejections).items()
+    )
 
 
 FREEZE_WINDOW_SECONDS = 10  # one clean segment + slack is all a frame needs
@@ -1137,17 +1121,7 @@ def _win_info(win):
 
 
 def _pick_window(
-    api,
-    camera,
-    stream,
-    wins,
-    ref,
-    rcfg,
-    cancel,
-    progress,
-    now,
-    recordings_dir,
-    check_drift,
+    camera, stream, wins, ref, rcfg, cancel, now, recordings_dir, check_drift
 ):
     """Screen candidates cheaply and seam-rank equivalent survivors.
 
@@ -1157,8 +1131,6 @@ def _pick_window(
     Per-candidate rejections log at DEBUG (job file); the operator log gets ONE
     grouped summary line per camera."""
     reasons = []
-    if not files_retrieval_available(recordings_dir):
-        return None, reasons, []  # export path screens after materializing
     deadline = time.monotonic() + GUARD_BUDGET_SECONDS
     picked = None
     survivors = []
@@ -1194,8 +1166,6 @@ def _pick_window(
                     break
                 continue
             reasons.append(reason)
-        except Cancelled:
-            raise
         except CaptureError as exc:
             log.debug(
                 "%s: candidate %s unusable: %s", stream, describe_window(win, now), exc
@@ -1259,12 +1229,7 @@ def _resolve_candidates(
 
 
 def _exportable_windows(wins, now, reasons):
-    """Keep the direct-file fast path from feeding fresh windows to export.
-
-    Direct reads can safely use settled files only five seconds behind live,
-    while Frigate's export worker has wedged on windows less than 30 seconds
-    old. A per-candidate fallback must retain the stricter export margin.
-    """
+    """Apply export's stricter freshness margin to direct-file fallbacks."""
     safe = [win for win in wins if now - win["end"] >= EXPORT_RECENT_MARGIN]
     skipped = len(wins) - len(safe)
     if skipped:
@@ -1275,6 +1240,44 @@ def _exportable_windows(wins, now, reasons):
             EXPORT_RECENT_MARGIN,
         )
     return safe
+
+
+def _from_exports(
+    api, camera, stream, wins, tmp_dir, cancel, progress, now, reasons, process, failure
+):
+    """Fetch guarded candidates serially, cleaning each temporary export."""
+    wins = _exportable_windows(wins, now, reasons)[:MAX_EXPORT_CANDIDATES]
+    for win in wins:
+        if cancel:
+            cancel.check()
+        clip = None
+        try:
+            clip = _fetch_window_clip(
+                api,
+                camera,
+                stream,
+                win,
+                tmp_dir,
+                cancel,
+                progress,
+                now,
+                recordings_dir=None,
+            )
+            return process(clip, win)
+        except CaptureError as exc:
+            log.debug(
+                "%s: export candidate %s unusable: %s",
+                stream,
+                describe_window(win, now),
+                exc,
+            )
+            reasons.append(str(exc))
+        finally:
+            _remove(clip)
+    raise CaptureError(
+        f"{failure} — {len(wins)} export candidate(s) rejected "
+        f"({_rejection_summary(reasons) or 'none'})"
+    )
 
 
 def _reference(api, camera, tmp_dir, rcfg, cancel, recordings_dir, ref):
@@ -1346,14 +1349,12 @@ def frame_from_recordings(
     if files:
         # a still frame cannot pulse: no intra-window drift check
         win, reasons, unavailable = _pick_window(
-            api,
             camera,
             stream,
             wins,
             ref,
             rcfg,
             cancel,
-            progress,
             now,
             recordings_dir,
             check_drift=False,
@@ -1386,46 +1387,24 @@ def frame_from_recordings(
                 "per-candidate detail at DEBUG in the job log"
             )
 
-    export_wins = _exportable_windows(export_wins, now, reasons)
-    for win in export_wins[:MAX_EXPORT_CANDIDATES]:
-        if cancel:
-            cancel.check()
-        tmp_clip = None
-        try:
-            # Reaching this path means direct files are absent or failed for
-            # this candidate. Force the Frigate export API rather than retrying
-            # the same direct path.
-            tmp_clip = _fetch_window_clip(
-                api,
-                camera,
-                stream,
-                win,
-                tmp_dir,
-                cancel,
-                progress,
-                now,
-                recordings_dir=None,
-            )
-            reason = _lighting_ok(tmp_clip, ref, rcfg, stream, win, now, cancel)
-            if reason:
-                reasons.append(reason)
-                continue
-            return extract(tmp_clip, win)
-        except CaptureError as exc:
-            log.debug(
-                "%s: export candidate %s unusable: %s",
-                stream,
-                describe_window(win, now),
-                exc,
-            )
-            reasons.append(str(exc))
-        finally:
-            if tmp_clip and os.path.exists(tmp_clip):
-                os.unlink(tmp_clip)
-    raise CaptureError(
-        f"no lighting-matched event-clear frame — "
-        f"{min(len(export_wins), MAX_EXPORT_CANDIDATES)}"
-        f" export candidate(s) rejected ({_rejection_summary(reasons) or 'none'})"
+    def use_export(clip, win):
+        reason = _lighting_ok(clip, ref, rcfg, stream, win, now, cancel)
+        if reason:
+            raise CaptureError(reason)
+        return extract(clip, win)
+
+    return _from_exports(
+        api,
+        camera,
+        stream,
+        export_wins,
+        tmp_dir,
+        cancel,
+        progress,
+        now,
+        reasons,
+        use_export,
+        "no lighting-matched event-clear frame",
     )
 
 
@@ -1445,6 +1424,7 @@ def source_clip_from_recordings(
     max_seconds=None,
     want_audio=None,
     out_path=None,
+    files_only=False,
 ):
     """Loop-clip pipeline: candidate windows -> lighting guards (vs-now AND
     intra-window drift: a clip spanning dawn/dusk pulses every loop) -> stitch
@@ -1509,14 +1489,12 @@ def source_clip_from_recordings(
     reasons = []
     if files:
         win, reasons, unavailable = _pick_window(
-            api,
             camera,
             stream,
             wins,
             ref,
             rcfg,
             cancel,
-            progress,
             now,
             recordings_dir,
             check_drift=True,
@@ -1538,17 +1516,10 @@ def source_clip_from_recordings(
                     want_audio=want_audio,
                 )
                 return finish(tmp_clip, win, audio_ready=True)
-            except Cancelled:
-                if tmp_clip and os.path.exists(tmp_clip):
-                    os.unlink(tmp_clip)
-                elif os.path.exists(out_path):
-                    os.unlink(out_path)
-                raise
-            except CaptureError as exc:
-                if tmp_clip and os.path.exists(tmp_clip):
-                    os.unlink(tmp_clip)
-                elif os.path.exists(out_path):
-                    os.unlink(out_path)
+            except BaseException as exc:
+                _remove(tmp_clip or out_path)
+                if not isinstance(exc, CaptureError):
+                    raise
                 reasons.append(str(exc))
                 log.warning(
                     "%s: direct loop assembly failed (%s) — trying Frigate " "export",
@@ -1558,12 +1529,6 @@ def source_clip_from_recordings(
                 export_wins = [win] + [
                     candidate for candidate in wins if candidate != win
                 ]
-            except BaseException:
-                if tmp_clip and os.path.exists(tmp_clip):
-                    os.unlink(tmp_clip)
-                elif os.path.exists(out_path):
-                    os.unlink(out_path)
-                raise
         elif unavailable:
             export_wins = unavailable
             log.warning(
@@ -1579,50 +1544,37 @@ def source_clip_from_recordings(
                 "per-candidate detail at DEBUG in the job log"
             )
 
-    export_wins = _exportable_windows(export_wins, now, reasons)
-    for win in export_wins[:MAX_EXPORT_CANDIDATES]:
-        if cancel:
-            cancel.check()
-        tmp_clip = None
-        try:
-            tmp_clip = _fetch_window_clip(
-                api,
-                camera,
-                stream,
-                win,
-                tmp_dir,
-                cancel,
-                progress,
-                now,
-                recordings_dir=None,
-            )
-            reason = _lighting_ok(
-                tmp_clip, ref, rcfg, stream, win, now, cancel
-            ) or _stable_across(
-                frame_stats(tmp_clip, cancel),
-                frame_stats_tail(tmp_clip, cancel),
-                rcfg,
-                stream,
-                win,
-                now,
-            )
-            if reason:
-                reasons.append(reason)
-                continue
-            return finish(tmp_clip, win)
-        except CaptureError as exc:
-            log.debug(
-                "%s: export candidate %s unusable: %s",
-                stream,
-                describe_window(win, now),
-                exc,
-            )
-            reasons.append(str(exc))
-        finally:
-            if tmp_clip and os.path.exists(tmp_clip):
-                os.unlink(tmp_clip)
-    raise CaptureError(
-        f"no lighting-stable loopable window — "
-        f"{min(len(export_wins), MAX_EXPORT_CANDIDATES)}"
-        f" export candidate(s) rejected ({_rejection_summary(reasons) or 'none'})"
+    def use_export(clip, win):
+        reason = _lighting_ok(
+            clip, ref, rcfg, stream, win, now, cancel
+        ) or _stable_across(
+            frame_stats(clip, cancel),
+            frame_stats_tail(clip, cancel),
+            rcfg,
+            stream,
+            win,
+            now,
+        )
+        if reason:
+            raise CaptureError(reason)
+        return finish(clip, win)
+
+    if files_only:
+        # Stage 2 runs after restart #1, when the export API lags minutes behind;
+        # keep it purely file-based — no direct loop just means stay on freeze.
+        raise CaptureError(
+            "no direct-file loop; export fallback suppressed (file-only stage)"
+        )
+    return _from_exports(
+        api,
+        camera,
+        stream,
+        export_wins,
+        tmp_dir,
+        cancel,
+        progress,
+        now,
+        reasons,
+        use_export,
+        "no lighting-stable loopable window",
     )

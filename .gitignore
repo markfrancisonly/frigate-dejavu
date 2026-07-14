@@ -7,7 +7,6 @@
 !/.github/
 !/.gitignore
 !/.dockerignore
-!/.env.example
 !/Dockerfile
 !/LICENSE
 !/README.md
@@ -17,6 +16,7 @@
 !/requirements.txt
 !/app/
 !/tests/
+!/homeassistant/
 !/.gitattributes
 
 # ...but never Python caches, even inside allowed directories:
