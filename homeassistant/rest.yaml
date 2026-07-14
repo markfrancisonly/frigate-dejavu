@@ -1,0 +1,24 @@
+# Append this entry to rest.yaml.
+- resource: "http://frigate-dejavu:8898/api/dejavu/status"
+  scan_interval: 20
+  timeout: 8
+  sensor:
+    - name: Frigate Privacy State
+      unique_id: frigate_privacy_state
+      value_template: "{{ value_json.state | default('unknown') }}"
+      icon: >-
+        {% set s = value_json.state | default('unknown') %}
+        {% if s == 'on' %}mdi:cctv-off
+        {% elif s in ['capturing', 'applying', 'restoring'] %}mdi:timer-sand
+        {% elif s == 'error' %}mdi:alert
+        {% else %}mdi:cctv{% endif %}
+      json_attributes:
+        - profile
+        - mode
+        - since
+        - session
+        - streams
+        - last_error
+        - note
+        - drift_detected
+        - frigate

@@ -1,0 +1,24 @@
+# Append these entries to rest_command.yaml.
+frigate_privacy_perimeter_on:
+  url: "http://frigate-dejavu:8898/api/dejavu/on"
+  method: POST
+  content_type: "application/json"
+  payload: '{"profile": "perimeter"}'
+
+frigate_privacy_indoor_on:
+  url: "http://frigate-dejavu:8898/api/dejavu/on"
+  method: POST
+  content_type: "application/json"
+  payload: '{"profile": "indoor"}'
+
+frigate_privacy_all_on:
+  url: "http://frigate-dejavu:8898/api/dejavu/on"
+  method: POST
+  content_type: "application/json"
+  payload: '{"profile": "all"}'
+
+frigate_privacy_off:
+  url: "http://frigate-dejavu:8898/api/dejavu/off"
+  method: POST
+  content_type: "application/json"
+  payload: "{}"

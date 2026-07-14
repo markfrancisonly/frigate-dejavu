@@ -1,12 +1,12 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-trixie
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
-# ffmpeg/ffprobe for capture + freeze synthesis, curl for the container healthcheck
+# ffmpeg/ffprobe for capture + freeze synthesis
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg curl \
+    && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt
@@ -22,6 +22,6 @@ WORKDIR /app
 EXPOSE 8898
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-    CMD curl -fsS http://localhost:8898/healthz >/dev/null || exit 1
+    CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8898/healthz', timeout=3).read()"]
 
 CMD ["python3", "/app/api.py"]

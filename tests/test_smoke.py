@@ -2,7 +2,9 @@ import copy
 import os
 import sys
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -19,15 +21,20 @@ import core  # noqa: E402
 import frigate  # noqa: E402
 import recordings  # noqa: E402
 
-_prior_config = os.environ.get("DEJAVU_CONFIG")
-os.environ["DEJAVU_CONFIG"] = str(ROOT / "config.example.yaml")
-try:
+EXAMPLE_CONFIG = ROOT / "config.example.yaml"
+EXAMPLE_ENV = {
+    "DEJAVU_API_TOKEN": "",
+    "DEJAVU_FRIGATE_TOKEN": "",
+    "DEJAVU_FRIGATE_USER": "",
+    "DEJAVU_FRIGATE_PASSWORD": "",
+}
+with mock.patch.dict(os.environ, {"DEJAVU_CONFIG": str(EXAMPLE_CONFIG), **EXAMPLE_ENV}):
     import api  # noqa: E402
-finally:
-    if _prior_config is None:
-        os.environ.pop("DEJAVU_CONFIG", None)
-    else:
-        os.environ["DEJAVU_CONFIG"] = _prior_config
+
+
+def load_example_config():
+    with mock.patch.dict(os.environ, EXAMPLE_ENV):
+        return config.load_config(str(EXAMPLE_CONFIG))
 
 
 SAMPLE_FRIGATE_CONFIG = """\
@@ -56,7 +63,7 @@ cameras:
 
 class ConfigTests(unittest.TestCase):
     def test_example_config_validates(self):
-        cfg = config.load_config(str(ROOT / "config.example.yaml"))
+        cfg = load_example_config()
         self.assertEqual("loop", cfg["profiles"]["default"]["mode"])
         for retired in (
             "swap_method",
@@ -76,8 +83,52 @@ class ConfigTests(unittest.TestCase):
             Path(path).unlink()
         self.assertEqual("loop", cfg["profiles"]["default"]["mode"])
 
+    def test_dejavu_env_placeholders_are_explicit(self):
+        text = """\
+frigate:
+  api_url: "http://{DEJAVU_TEST_HOST}:5000"
+  api_auth:
+    token: "{DEJAVU_TEST_TOKEN}"
+api:
+  bearer_token: literal
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
+            handle.write(text)
+            path = handle.name
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "DEJAVU_TEST_HOST": "frigate.local",
+                    "DEJAVU_TEST_TOKEN": "secret",
+                    "DEJAVU_API_TOKEN": "must-not-override",
+                },
+            ):
+                cfg = config.load_config(path)
+        finally:
+            Path(path).unlink()
+        self.assertEqual("http://frigate.local:5000", cfg["frigate"]["api_url"])
+        self.assertEqual("secret", cfg["frigate"]["api_auth"]["token"])
+        self.assertEqual("literal", cfg["api"]["bearer_token"])
+
+    def test_missing_auth_env_placeholder_is_rejected(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(config.ConfigError, "DEJAVU_FRIGATE_TOKEN"):
+                config.load_config(str(EXAMPLE_CONFIG))
+
+    def test_missing_dejavu_env_placeholder_is_rejected(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
+            handle.write('api:\n  bearer_token: "{DEJAVU_TEST_MISSING}"\n')
+            path = handle.name
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(config.ConfigError, "DEJAVU_TEST_MISSING"):
+                    config.load_config(path)
+        finally:
+            Path(path).unlink()
+
     def test_implicit_profile_mode_is_consistently_freeze(self):
-        cfg = config.load_config(str(ROOT / "config.example.yaml"))
+        cfg = load_example_config()
         cfg["profiles"]["implicit"] = {"cameras": []}
 
         self.assertEqual(
@@ -86,7 +137,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual("freeze", core.resolved_profiles(cfg)["implicit"]["mode"])
 
     def test_state_write_drops_retired_template_flag(self):
-        cfg = config.load_config(str(ROOT / "config.example.yaml"))
+        cfg = load_example_config()
         with tempfile.TemporaryDirectory() as tmp:
             cfg["paths"]["state_dir"] = str(Path(tmp) / "state")
             cfg["paths"]["tmp_dir"] = str(Path(tmp) / "tmp")
@@ -144,7 +195,7 @@ class ApiValidationTests(unittest.TestCase):
 
 class FrigateConfigTests(unittest.TestCase):
     def setUp(self):
-        self.cfg = config.load_config(str(ROOT / "config.example.yaml"))
+        self.cfg = load_example_config()
         self.yaml, self.data = frigate.parse_config(SAMPLE_FRIGATE_CONFIG)
 
     def test_stream_resolution(self):
@@ -225,7 +276,409 @@ class RestartTests(unittest.TestCase):
         self.assertFalse(hasattr(frigate.FrigateClient, "docker_restart"))
 
 
+class LoopSearchDeadlineTests(unittest.TestCase):
+    """The loop search runs while cameras are still live, so it is bounded: a
+    stream that has not found a loop by the deadline engages on its freeze clip
+    instead of holding privacy back for a slow scan."""
+
+    def test_any_cancel_follows_its_source(self):
+        source = core.CancelToken()
+        cancel = core._AnyCancel(source)
+        self.assertFalse(cancel.cancelled)
+        source.cancel()  # e.g. a SIGTERM cancels the whole job
+        self.assertTrue(cancel.cancelled)
+        with self.assertRaises(core.Cancelled):
+            cancel.check()
+
+    def test_search_within_budget_is_collected(self):
+        cancel = core._AnyCancel()
+        pool = ThreadPoolExecutor(max_workers=2)
+        try:
+            futures = {
+                "a": pool.submit(lambda: {"clip": "a"}),
+                "b": pool.submit(lambda: {"clip": "b"}),
+            }
+            upgrades = core._collect_upgrades(futures, {"a", "b"}, cancel, 30)
+        finally:
+            pool.shutdown(wait=True)
+        self.assertEqual({"a", "b"}, set(upgrades))
+        self.assertFalse(cancel.cancelled)  # generous budget never trips the timer
+
+    def test_slow_search_is_abandoned_at_the_deadline(self):
+        cancel = core._AnyCancel()
+        pool = ThreadPoolExecutor(max_workers=2)
+
+        def slow():
+            # a real search polls the cancel token; stop once the deadline trips
+            # it, exactly as source_clip_from_recordings would.
+            while not cancel.cancelled:
+                time.sleep(0.01)
+            raise core.Cancelled()
+
+        try:
+            futures = {
+                "fast": pool.submit(lambda: {"clip": "fast"}),
+                "slow": pool.submit(slow),
+            }
+            upgrades = core._collect_upgrades(futures, {"fast", "slow"}, cancel, 0.2)
+        finally:
+            pool.shutdown(wait=True)
+        self.assertEqual({"fast"}, set(upgrades))  # slow stream stays on freeze
+        self.assertTrue(cancel.cancelled)
+
+
+class TwoStageEngageTests(unittest.TestCase):
+    """Stage 1 is a permanent freeze baseline; stage 2 is a best-effort loop
+    upgrade that a concurrent 'off' can cancel and that never turns privacy off."""
+
+    def _store(self, tmp):
+        cfg = load_example_config()
+        cfg["paths"]["state_dir"] = str(Path(tmp) / "state")
+        cfg["paths"]["tmp_dir"] = str(Path(tmp) / "tmp")
+        cfg["paths"]["clips_local"] = str(Path(tmp) / "clips")
+        return cfg, core.StateStore(cfg)
+
+    def test_reconcile_clears_dead_upgrade_and_stays_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            store._write({"state": "on", "job_pid": None, "upgrade_pid": 424242})
+            with mock.patch.object(core, "pid_alive", return_value=False):
+                with store.locked():
+                    st = core.reconcile_locked(store)
+            self.assertEqual("on", st["state"])  # freeze baseline stays, NOT error
+            self.assertIsNone(st.get("upgrade_pid"))  # phantom marker cleared
+
+    def test_off_preempts_upgrade_without_debounce(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            # a live upgrade + a fresh completion timestamp that WOULD debounce
+            store._write(
+                {
+                    "state": "on",
+                    "job_pid": None,
+                    "upgrade_pid": os.getpid(),
+                    "last_completed_ts": time.time(),
+                }
+            )
+            self.assertEqual({"noop": False}, core.preflight(cfg, "off"))
+
+    def test_off_still_debounces_plain_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            cfg["api"]["debounce_seconds"] = 30
+            store._write(
+                {
+                    "state": "on",
+                    "job_pid": None,
+                    "upgrade_pid": None,
+                    "last_completed_ts": time.time(),
+                }
+            )
+            with self.assertRaises(core.Busy):
+                core.preflight(cfg, "off")
+
+    def test_stage2_superseded_by_off_does_not_promote_or_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            os.makedirs(cfg["paths"]["clips_local"], exist_ok=True)
+            # 'off' already claimed the transition out from under the upgrade
+            store._write({"state": "restoring", "job_pid": 999, "session": "s1"})
+            job = core.Job.__new__(core.Job)
+            job.cfg, job.store, job.cancel, job.phase = (
+                cfg,
+                store,
+                core.CancelToken(),
+                "upgrading",
+            )
+            job.soft_restart = mock.Mock()
+            record = {
+                "cam": {"clip_source": "restream", "rung": "live", "mode": "loop"}
+            }
+            with (
+                mock.patch.object(
+                    core,
+                    "_start_upgrades",
+                    return_value=(mock.Mock(), {"cam": mock.Mock()}),
+                ),
+                mock.patch.object(
+                    core, "_collect_upgrades", return_value={"cam": {"clip": "x"}}
+                ),
+                mock.patch.object(core, "_promote_upgrades") as promote,
+            ):
+                core._run_loop_upgrade(
+                    cfg,
+                    job,
+                    {"seconds": 300},
+                    {"cam": {}},
+                    {"cam": {}},
+                    record,
+                    {"cam": "src"},
+                    "s1",
+                )
+            job.soft_restart.assert_not_called()  # never restarts once superseded
+            promote.assert_not_called()  # never promotes
+            self.assertEqual("restoring", store.read()["state"])  # off's state intact
+
+    def test_budget_expiry_still_promotes_completed_loops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            os.makedirs(cfg["paths"]["clips_local"], exist_ok=True)
+            store._write(
+                {
+                    "state": "on",
+                    "job_pid": None,
+                    "upgrade_pid": os.getpid(),
+                    "session": "s1",
+                    "streams": {"cam": {"phase": "searching"}},
+                }
+            )
+            job = core.Job.__new__(core.Job)
+            job.cfg, job.store, job.cancel, job.phase = (
+                cfg,
+                store,
+                core.CancelToken(),
+                "upgrading",
+            )
+            job.soft_restart = mock.Mock()
+            record = {
+                "cam": {"clip_source": "recordings", "rung": "loop", "mode": "loop"}
+            }
+
+            def fake_collect(futures, allowed, cancel, budget):
+                cancel.cancel()  # simulate the budget timer firing during collect
+                return {"cam": {"clip": "x"}}
+
+            with (
+                mock.patch.object(
+                    core,
+                    "_start_upgrades",
+                    return_value=(mock.Mock(), {"cam": mock.Mock()}),
+                ),
+                mock.patch.object(core, "_collect_upgrades", side_effect=fake_collect),
+                mock.patch.object(
+                    core, "_promote_upgrades", return_value=["cam"]
+                ) as promote,
+            ):
+                core._run_loop_upgrade(
+                    cfg,
+                    job,
+                    {"seconds": 300},
+                    {"cam": {}},
+                    {"cam": {}},
+                    record,
+                    {"cam": "src"},
+                    "s1",
+                )
+            # budget expiry must NOT discard the loops that finished in time
+            promote.assert_called_once()
+            job.soft_restart.assert_called_once()
+            self.assertEqual("on", store.read()["state"])
+
+    def test_no_loop_found_clears_stale_upgrading_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            os.makedirs(cfg["paths"]["clips_local"], exist_ok=True)
+            store._write(
+                {
+                    "state": "on",
+                    "job_pid": None,
+                    "upgrade_pid": os.getpid(),
+                    "session": "s1",
+                    "note": "restart=frigate-api; upgrading",
+                    "streams": {"cam": {"phase": "searching"}},
+                }
+            )
+            job = core.Job.__new__(core.Job)
+            job.cfg, job.store, job.cancel, job.phase = (
+                cfg,
+                store,
+                core.CancelToken(),
+                "upgrading",
+            )
+            job.soft_restart = mock.Mock()
+            record = {
+                "cam": {"clip_source": "restream", "rung": "live", "mode": "loop"}
+            }
+            with (
+                mock.patch.object(
+                    core,
+                    "_start_upgrades",
+                    return_value=(mock.Mock(), {"cam": mock.Mock()}),
+                ),
+                mock.patch.object(core, "_collect_upgrades", return_value={}),
+            ):
+                core._run_loop_upgrade(
+                    cfg,
+                    job,
+                    {"seconds": 300},
+                    {"cam": {}},
+                    {"cam": {}},
+                    record,
+                    {"cam": "src"},
+                    "s1",
+                )
+            s = store.read()
+            self.assertEqual("on", s["state"])  # freeze baseline stands
+            self.assertIsNone(s.get("upgrade_pid"))  # marker cleared
+            self.assertNotIn("upgrading", s.get("note") or "")  # note no longer stale
+            job.soft_restart.assert_not_called()
+
+    def test_register_terminates_proc_registered_after_cancel(self):
+        tok = core.CancelToken()
+        tok.cancel()
+        proc = mock.Mock()
+        tok.register(proc)  # registered AFTER cancel -> must be killed at once
+        proc.terminate.assert_called_once()
+
+    def test_soft_restart_reports_staged_when_no_restart_observed(self):
+        # A no-op /api/restart (frigate never goes down) must NOT be reported as
+        # loops-live: go2rtc still holds the freeze inode. The path check alone
+        # (verify_dejavu_applied) would falsely pass, so it must not be reached.
+        job = core.Job.__new__(core.Job)
+        job.cfg = {"frigate": {"health_timeout_seconds": 5}}
+        job.client = mock.Mock()
+        job.client.wait_down.return_value = False  # frigate NOT observed restarting
+        job.client.wait_healthy.return_value = True
+        with mock.patch.object(frigate, "verify_dejavu_applied") as verify:
+            result = job.soft_restart({"cam": "cam.dejavu.mp4"})
+        self.assertFalse(result)  # loops staged, not live
+        verify.assert_not_called()  # never trust the tautological path check here
+        job.client.restart_api.assert_called_once()
+
+    def test_soft_restart_reports_live_when_restart_observed(self):
+        job = core.Job.__new__(core.Job)
+        job.cfg = {"frigate": {"health_timeout_seconds": 5}}
+        job.client = mock.Mock()
+        job.client.wait_down.return_value = True  # observed down -> go2rtc re-opened
+        job.client.wait_healthy.return_value = True
+        with mock.patch.object(
+            frigate, "verify_dejavu_applied", return_value=(True, [])
+        ):
+            result = job.soft_restart({"cam": "cam.dejavu.mp4"})
+        self.assertTrue(result)
+
+    def test_busy_message_has_no_baked_in_prefix(self):
+        # The CLI (dejavu.py) renders `busy: {exc}`; the exception message must
+        # NOT carry its own 'busy:' prefix or it double-prefixes.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            store._write({"state": "applying", "job_pid": os.getpid()})
+            with self.assertRaises(core.Busy) as ctx:
+                core.preflight(cfg, "off")
+        self.assertNotIn("busy:", str(ctx.exception).lower())
+
+
+class ExportLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def _response(status, body=None, text=""):
+        response = mock.Mock(status_code=status, text=text)
+        response.json.return_value = body
+        return response
+
+    def test_start_uses_export_id_from_response(self):
+        response = self._response(200, {"success": True, "export_id": "front_abc123"})
+        with mock.patch.object(recordings, "http_post", return_value=response) as post:
+            export_id = recordings.start_export("http://frigate", "front", 10, 20)
+
+        self.assertEqual("front_abc123", export_id)
+        self.assertIn(
+            "/api/export/front/start/10.000/end/20.000", post.call_args.args[0]
+        )
+
+    def test_start_rejects_response_without_export_id(self):
+        response = self._response(200, {"success": True})
+        with mock.patch.object(recordings, "http_post", return_value=response):
+            with self.assertRaisesRegex(recordings.CaptureError, "export_id"):
+                recordings.start_export("http://frigate", "front", 10, 20)
+
+    def test_wait_polls_only_returned_export_id(self):
+        responses = [
+            self._response(404, {"success": False}),
+            self._response(200, {"id": "front_abc123", "in_progress": True}),
+            self._response(200, {"id": "front_abc123", "in_progress": False}),
+        ]
+        cancel = mock.Mock()
+        with (
+            mock.patch.object(recordings, "http_get", side_effect=responses) as get,
+            mock.patch.object(recordings.time, "sleep"),
+        ):
+            entry = recordings.wait_export("http://frigate", "front_abc123", cancel)
+
+        self.assertFalse(entry["in_progress"])
+        self.assertEqual(
+            ["http://frigate/api/exports/front_abc123"] * 3,
+            [call.args[0] for call in get.call_args_list],
+        )
+
+    def test_delete_uses_only_returned_export_id(self):
+        deleted = self._response(200)
+        with mock.patch.object(
+            recordings, "http_delete", return_value=deleted
+        ) as delete:
+            recordings.delete_export("http://frigate", "front_abc123")
+
+        self.assertEqual(
+            "http://frigate/api/export/front_abc123", delete.call_args.args[0]
+        )
+
+
 class RecordingWindowTests(unittest.TestCase):
+    LOOP_META = {
+        "video_codec": "h264",
+        "audio_codec": None,
+        "duration": 300,
+        "width": 1920,
+        "height": 1080,
+        "fps": 15,
+    }
+
+    @staticmethod
+    def _window(start=0):
+        return {
+            "start": start,
+            "end": start + 300,
+            "duration": 300,
+            "full": True,
+            "tier": recordings.TIER_QUIET,
+            "motion_ps": 0,
+            "activity_fraction": 0,
+            "segments": [start, start + 10],
+        }
+
+    def _source_with(self, wins, files, fetch, pick=None):
+        patches = {
+            "files_retrieval_available": mock.Mock(return_value=files),
+            "_resolve_candidates": mock.Mock(return_value=wins),
+            "_reference": mock.Mock(return_value=None),
+            "_fetch_window_clip": fetch,
+            "_lighting_ok": mock.Mock(return_value=None),
+            "frame_stats": mock.Mock(return_value={}),
+            "frame_stats_tail": mock.Mock(return_value={}),
+            "_stable_across": mock.Mock(return_value=None),
+            "probe_file": mock.Mock(return_value={}),
+            "summarize_probe": mock.Mock(return_value=self.LOOP_META),
+            "apply_audio_policy": mock.Mock(return_value=False),
+        }
+        if pick is not None:
+            patches["_pick_window"] = mock.Mock(return_value=pick)
+        with (
+            mock.patch.multiple(recordings, **patches),
+            mock.patch.object(recordings.log, "warning"),
+        ):
+            return recordings.source_clip_from_recordings(
+                "api",
+                "camera",
+                "stream",
+                "/clips",
+                "/tmp",
+                300,
+                {"min_seconds": 20, "audio": "silence"},
+                None,
+                lambda *_: None,
+                recordings_dir="/recordings" if files else None,
+                max_seconds=1200,
+            )
+
     def test_quiet_window_is_selected(self):
         now = 10_000.0
         segments = [
@@ -418,14 +871,12 @@ class RecordingWindowTests(unittest.TestCase):
             ),
         ):
             picked, reasons, unavailable = recordings._pick_window(
-                "api",
                 "camera",
                 "stream",
                 wins,
                 None,
                 {},
                 None,
-                lambda *_: None,
                 now=1200,
                 recordings_dir="/recordings",
                 check_drift=True,
@@ -436,119 +887,19 @@ class RecordingWindowTests(unittest.TestCase):
         self.assertEqual(5.0, picked["seam_delta"])
 
     def test_missing_direct_segments_fall_back_to_frigate_export(self):
-        win = {
-            "start": 0,
-            "end": 300,
-            "duration": 300,
-            "full": True,
-            "tier": recordings.TIER_QUIET,
-            "motion_ps": 0,
-            "activity_fraction": 0,
-            "segments": [0, 10],
-        }
-        meta = {
-            "video_codec": "h264",
-            "audio_codec": None,
-            "duration": 300,
-            "width": 1920,
-            "height": 1080,
-            "fps": 15,
-        }
-        with (
-            mock.patch.object(
-                recordings, "files_retrieval_available", return_value=True
-            ),
-            mock.patch.object(recordings, "_resolve_candidates", return_value=[win]),
-            mock.patch.object(recordings, "_reference", return_value=None),
-            mock.patch.object(
-                recordings, "_pick_window", return_value=(None, ["missing"], [win])
-            ),
-            mock.patch.object(
-                recordings, "_fetch_window_clip", return_value="export.mp4"
-            ) as fetch,
-            mock.patch.object(recordings, "_lighting_ok", return_value=None),
-            mock.patch.object(recordings, "frame_stats", return_value={}),
-            mock.patch.object(recordings, "frame_stats_tail", return_value={}),
-            mock.patch.object(recordings, "_stable_across", return_value=None),
-            mock.patch.object(recordings, "probe_file", return_value={}),
-            mock.patch.object(recordings, "summarize_probe", return_value=meta),
-            mock.patch.object(recordings, "apply_audio_policy", return_value=False),
-            mock.patch.object(recordings.log, "warning"),
-        ):
-            result = recordings.source_clip_from_recordings(
-                "api",
-                "camera",
-                "stream",
-                "/clips",
-                "/tmp",
-                300,
-                {"min_seconds": 20, "audio": "silence"},
-                None,
-                lambda *_: None,
-                recordings_dir="/recordings",
-                max_seconds=1200,
-            )
+        win = self._window()
+        fetch = mock.Mock(return_value="export.mp4")
+        result = self._source_with([win], True, fetch, (None, ["missing"], [win]))
 
         self.assertEqual("h264", result["clip_meta"]["video_codec"])
         self.assertIsNone(fetch.call_args.kwargs["recordings_dir"])
 
     def test_failed_export_advances_to_next_candidate(self):
-        wins = [
-            {
-                "start": start,
-                "end": start + 300,
-                "duration": 300,
-                "full": True,
-                "tier": recordings.TIER_QUIET,
-                "motion_ps": 0,
-                "activity_fraction": 0,
-                "segments": [start, start + 10],
-            }
-            for start in (0, 600)
-        ]
-        meta = {
-            "video_codec": "h264",
-            "audio_codec": None,
-            "duration": 300,
-            "width": 1920,
-            "height": 1080,
-            "fps": 15,
-        }
-        with (
-            mock.patch.object(
-                recordings, "files_retrieval_available", return_value=False
-            ),
-            mock.patch.object(recordings, "_resolve_candidates", return_value=wins),
-            mock.patch.object(recordings, "_reference", return_value=None),
-            mock.patch.object(
-                recordings,
-                "_fetch_window_clip",
-                side_effect=[
-                    recordings.CaptureError("first export failed"),
-                    "second.mp4",
-                ],
-            ) as fetch,
-            mock.patch.object(recordings, "_lighting_ok", return_value=None),
-            mock.patch.object(recordings, "frame_stats", return_value={}),
-            mock.patch.object(recordings, "frame_stats_tail", return_value={}),
-            mock.patch.object(recordings, "_stable_across", return_value=None),
-            mock.patch.object(recordings, "probe_file", return_value={}),
-            mock.patch.object(recordings, "summarize_probe", return_value=meta),
-            mock.patch.object(recordings, "apply_audio_policy", return_value=False),
-        ):
-            result = recordings.source_clip_from_recordings(
-                "api",
-                "camera",
-                "stream",
-                "/clips",
-                "/tmp",
-                300,
-                {"min_seconds": 20, "audio": "silence"},
-                None,
-                lambda *_: None,
-                recordings_dir=None,
-                max_seconds=1200,
-            )
+        wins = [self._window(start) for start in (0, 600)]
+        fetch = mock.Mock(
+            side_effect=[recordings.CaptureError("first export failed"), "second.mp4"]
+        )
+        result = self._source_with(wins, False, fetch)
 
         self.assertEqual("h264", result["clip_meta"]["video_codec"])
         self.assertEqual(2, fetch.call_count)
@@ -572,7 +923,7 @@ class RecordingWindowTests(unittest.TestCase):
 
 class CachedFrameTests(unittest.TestCase):
     def test_cached_frame_retains_codec_resolution_and_audio_shape(self):
-        cfg = config.load_config(str(ROOT / "config.example.yaml"))
+        cfg = load_example_config()
         meta = {
             "video_codec": "hevc",
             "width": 3840,

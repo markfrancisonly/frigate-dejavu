@@ -1,0 +1,35 @@
+# Append this entry to template.yaml.
+- select:
+    - name: Frigate Privacy
+      unique_id: frigate_privacy_mode
+      availability: "{{ has_value('sensor.frigate_privacy_state') }}"
+      options: "{{ ['Off', 'Perimeter', 'Indoor', 'All Cameras'] }}"
+      state: >-
+        {% set s = states('sensor.frigate_privacy_state') %}
+        {% set p = state_attr('sensor.frigate_privacy_state', 'profile') %}
+        {% if s in ['on', 'capturing', 'applying'] %}
+          {{ {'perimeter': 'Perimeter', 'indoor': 'Indoor', 'all': 'All Cameras'}.get(p, 'Off') }}
+        {% else %}
+          Off
+        {% endif %}
+      optimistic: true
+      icon: >-
+        {% set s = states('sensor.frigate_privacy_state') %}
+        {% if s == 'on' %}mdi:cctv-off
+        {% elif s in ['capturing', 'applying', 'restoring'] %}mdi:timer-sand
+        {% elif s == 'error' %}mdi:alert
+        {% else %}mdi:cctv{% endif %}
+      select_option:
+        - choose:
+            - conditions: "{{ option == 'Off' }}"
+              sequence:
+                - action: rest_command.frigate_privacy_off
+            - conditions: "{{ option == 'Perimeter' }}"
+              sequence:
+                - action: rest_command.frigate_privacy_perimeter_on
+            - conditions: "{{ option == 'Indoor' }}"
+              sequence:
+                - action: rest_command.frigate_privacy_indoor_on
+            - conditions: "{{ option == 'All Cameras' }}"
+              sequence:
+                - action: rest_command.frigate_privacy_all_on
