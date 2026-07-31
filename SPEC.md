@@ -15,6 +15,81 @@ proxy before exposing the API to a LAN or wider network.
 
 ## 1. Problem & approach
 
+**Guiding axiom.** Déjà Vu is never real, and that is the point: it produces a
+convincing *false reality*. The objective is not fidelity to what the cameras
+actually see — there is none to preserve — but **undetectability**: a
+fabrication indistinguishable from real. A false reality is exposed only by
+*contradiction*, on two surfaces:
+
+- **Internal** — it disagrees with itself: a loop tell, an object teleporting
+  between rotations, overlapping cameras out of sync (§5b), the out-of-band
+  sensor mesh disagreeing with the served feed. Déjà Vu controls this surface
+  completely.
+- **External** — it disagrees with what an observer can *independently* verify:
+  the weather, a delivery, having been present at the time. The forgery can be
+  flawless with itself and still be caught by a fact that leaked in through a
+  channel Déjà Vu does not own.
+
+Every guard in this spec reduces to one rule — *keep the false world from
+contradicting itself or the world* — and to one corollary: **assert as little
+as possible**. A frozen frame is the strongest lie because it claims almost
+nothing; long dynamic fabrication is the hardest because every second it claims
+more. Freeze is therefore never a failure state but the minimal, most-defensible
+false reality (the §5c ladder floor, the §19 rotation floor). "Best-effort
+plausibility, not verified fidelity" (§19) is a direct consequence: mid-session
+there is no live ground truth to match, only self-consistency to preserve.
+
+The design frame is a professional privacy utility, not an alibi, and its
+audience split is deliberate: **users are in the dark; admins see it plainly.**
+The deception is user-wide. Every non-admin viewer of the Frigate interface,
+every downstream video consumer (HA cards, WebRTC/MSE viewers, HomeKit,
+birdseye), and Frigate's own record/detect pipeline keep operating unaware that
+a stream was swapped at all — Frigate itself cannot tell Déjà Vu is active
+(§4.3), and that consumer-blind layer is exactly where this tool lives. A
+casual, non-admin observer should find nothing that reads as fabricated. That is
+the magic.
+
+A true administrator is the opposite audience. To an operator, Déjà Vu's active
+state should be **plainly visible — even deliberately advertised** — at the
+non-user/operator level: its own `status` and logs already say so, and an
+unmistakable operator-facing indicator that privacy is engaged is a feature, not
+a leak. There is no plausible deniability against an operator, by design: the
+tool never lies to the hand that runs it. That is the honest line between a
+privacy utility and an alibi — the deception points outward at consumers, never
+inward at the operator, and the forensic/host record (mtimes, encoder
+fingerprints, the Docker/host restart record) is likewise expected to reveal the
+mechanism to anyone who inspects properly. That transparency is no license to be a
+nuisance. Two courtesies apply, both manners rather than concealment. *Leave no
+trace, pack it out:* the smallest possible persistent footprint — surgical
+byte-identical restore, no needless config churn, no orphaned clips or state.
+*Do not disturb the wildlife:* the smallest possible disruption to the living
+system while operating — every downstream consumer, recording, detection, and
+neighboring service should carry on with as little collateral perturbation as
+the mechanism allows. The restart is the loudest disturbance on both counts,
+which is a further reason seam elimination (§17.1/§18) is the goal: a swap the
+ecosystem never feels, not merely one it can't see.
+
+So the only tells worth suppressing are those a *non-admin user* could stumble
+on in ordinary viewing — and here the goal is stronger than "no gap." **A user
+scrubbing the recording timeline should not be able to LOCATE THE SWITCHOVER at
+all, in either direction:** neither a missing-recording gap nor a content
+discontinuity should mark the instant privacy engaged or disengaged; the
+transition into the loop, and back out of it, should pass unnoticed under a
+scrub. This is pursued purely on the content side — freeze-on-the-current-frame
+for visual continuity at engage, gap continuity and loop-seam matching (§17.3),
+and ultimately the restart-less swap that removes the gap outright (§17.1/§18) —
+*not tipping off users*, never *hiding from admins*. Scrubbing Frigate's logs,
+event DB, the host journal, or Docker's restart record is cover-tracks/alibi
+work: a hard non-goal (§14), and — since admins are meant to see it — pointless
+besides. Honest reach: some seams are inherent — the disengage back to a scene
+that has since diverged, and any real activity present at the engage instant,
+produce a genuine jump no replay fully hides — so the goal is *unlocatable
+wherever the scene is quiet and continuous, and as close as the material allows
+where it is not.* This remains a goal even where it is not fully attainable.
+Current state: under the shipped `frigate-config` backend a restart briefly
+shows in the logs panel and leaves a recording gap a user could notice; the §17
+roadmap closes that user-facing tell while keeping the operator fully informed.
+
 Frigate is production CCTV (recording, detection, HA integration, WebRTC
 viewers). Sometimes the household wants cameras "paused" without stopping
 recording infrastructure, tipping off consumers, or leaving config drift.
@@ -207,7 +282,9 @@ tolerates sparse activity, rather than insisting on short absolute silence.
 
 Per stream, parallelized (`capture.parallel`):
 
-1. **Candidate search** over the last `recordings.search_hours` (default 4 h):
+1. **Candidate search** over the last `recordings.search_hours` (default 3 h —
+   ≈ one lighting period (§19), so a sourced loop is never engaged more than
+   one period stale):
    `GET /api/<camera>/recordings?after&before` per-segment `objects`/`motion`
    + `GET /api/events` overlap (±2 s pad, labelled; open-ended events block
    onward). Candidates are produced in three tiers, best first:
@@ -259,13 +336,18 @@ Per stream, parallelized (`capture.parallel`):
    (nearest now) is probed first, so a stale-lighting candidate costs one
    probe, not two. Up to three survivors in the same recency/tier group are
    ranked by mean 16×16 endpoint luma difference to minimize the visible seam.
-4. **Stitch** the winner from its segment files (`-f concat -c copy`). Stage-2
-   loop assembly is **file-only — there is no export-API fallback for loops**:
-   stage 2 runs after restart #1 while Frigate's export worker is still settling
-   (minutes-long lag, §16), so a candidate whose segment files are
-   missing/unreadable is skipped and, if nothing assembles, the stream stays on
-   its freeze frame. (The freeze ladder's recorded-*frame* rung, §5c, still falls
-   back to the export API — it runs pre-restart, while Frigate is up.) Direct-file
+4. **Stitch** the winner from its segment files (`-f concat -c copy`). The
+   Frigate export API is the per-candidate fallback when the mount is absent, a
+   candidate's segment files are missing/unreadable, or direct assembly fails.
+   The first actual export use (eagerly when the mount is absent, lazily after a
+   failed direct read) passes through one shared readiness gate
+   (`wait_exports_ready`, bounded, cancellable) — the worker lags minutes behind
+   a Frigate restart and `/api/version` lies about readiness (§16). The readiness
+   wait consumes the same overall loop-assembly budget as the searches. Exports
+   remain strictly serialized (the worker wedges under concurrent jobs) and keep
+   the export path's 30-second freshness margin; a
+   failed export advances to the next ranked candidate, and if nothing
+   assembles the stream stays on its freeze frame. Direct-file
    assembly applies the **audio policy in the same ffmpeg
    pass** (`recordings.audio`, default `silence`: same-rate/channel silent AAC —
    repeating audio is the most obvious tell). The clip's audio presence is
@@ -297,16 +379,18 @@ coordinated Frigate restart (**restart #1**). Privacy is now immediate,
 guaranteed, and permanent: no stream is ever left live.
 
 **Stage 2** runs in the background afterward, while already private. It assembles
-each loop from the local `/recordings` segment files (§5b; file-only, no export
-fallback), atomically `os.replace`s each finished loop over its freeze clip at
-the SAME path, and swaps them in through a SECOND coordinated Frigate restart
-(**restart #2**). Because the config clip path is byte-identical for a freeze and
-its loop, restart #2 needs no config change — it just makes go2rtc re-open the
-swapped file. A stream whose loop is not ready within
+each loop from the local `/recordings` segment files (§5b; export-API fallback
+when the mount is absent or a candidate is unreadable, gated on the export
+worker settling), atomically `os.replace`s each finished loop over its freeze
+clip at the SAME path, and swaps them in through a SECOND coordinated Frigate
+restart (**restart #2**). Because the config clip path is byte-identical for a
+freeze and its loop, restart #2 needs no config change — it just makes go2rtc
+re-open the swapped file. A stream whose loop is not ready within
 `capture.loop_assembly_budget_seconds` (default 900), or that never finds a
 suitable window, stays on its freeze frame permanently — a success, not a
-failure. Loop mode therefore requires a directly-readable `/recordings` mount;
-without one, stage 2 is skipped and every stream stays on freeze.
+failure. Every non-black freeze rung carries its own lighting reference (for an
+offline camera the frozen frame IS what a loop must match), so offline cameras
+with recent recordings upgrade too.
 
 The safety floor remains "stream shows a still frame," never "stream stays live
 after the appliance reports on."
@@ -352,10 +436,10 @@ job — every error leaves the permanent freeze baseline standing.
 9. State `on` is published with `job_pid` cleared and a persisted `upgrade_pid`
    marker naming the live upgrade process, so a concurrent `off` can find and
    cancel it (and a stage-2 crash reconciles to a safe `on`, never `error`).
-   Stage 2 is gated on a directly-readable `/recordings` mount — absent it, the
-   upgrade is skipped and every stream stays on freeze.
-10. Assemble each loop from the local segment files (file-only, no export
-    fallback — the export API lags minutes after restart #1, §16), bounded by
+10. Assemble each loop from the local segment files when the mount is readable;
+    otherwise wait for the export worker to settle (it lags minutes after
+    restart #1, §16) and ride the serialized export API. The settle wait and
+    assembly share the bound set by
     `capture.loop_assembly_budget_seconds` (default 900). A stream whose loop is
     not ready in time, or that finds no window, stays on its freeze frame
     permanently.
@@ -395,10 +479,10 @@ job — every error leaves the permanent freeze baseline standing.
 - Restarts use Frigate's `POST /api/restart`. The appliance has no Docker API
   access and does not mount the Docker socket. If Frigate's API cannot recover,
   the transition reports `error` and an operator restarts Frigate externally.
-- Loop mode uses TWO engage restarts — restart #1 (freeze, privacy on) and, after
-  the background loop upgrade, restart #2 (swap the loops in). Freeze mode uses
-  one engage restart, and restore uses one. There is no configurable or live-swap
-  path.
+- Loop mode uses TWO engage restarts — restart #1 (freeze, privacy on) and,
+  after the background loop upgrade, restart #2 (swap the loops in). Freeze mode
+  uses one engage restart, and restore uses one. There is no live-swap path
+  (until the `proxy-interpose` backend of §18, design).
 
 ## 9. State machine, locking, debounce, cancellation
 
@@ -528,7 +612,7 @@ capture:
   parallel_frames: 8                  # concurrent live frame grabs
   keep_clips_after_off: false
   recordings:
-    search_hours: 4
+    search_hours: 3
     min_seconds: 20
     audio: silence                    # silence | keep | strip
     max_brightness_delta: 60          # 0-255; 0 disables
@@ -594,11 +678,11 @@ compose highlights:
     `./config:/config` mount**, so the frigate container needs NO compose
     change and NO recreate; go2rtc sees clips at `/config/dejavu-clips/…`.
   - `/mnt/frigate/recordings:/recordings:ro` — Frigate's segment files, read
-    directly for loop sourcing (§5b). The stage-2 loop upgrade is **file-only**:
-    without a directly-readable mount its streams stay on their freeze frames
-    (§5c), and there is no export-API fallback for loops. (Freeze-mode
-    recorded-*frame* sourcing, which runs pre-restart, still falls back to the
-    export API for individual missing/unreadable segments.)
+    directly for loop sourcing (§5b). The mount is a fast path, not a
+    requirement: without it loop sourcing falls back to the (serialized)
+    Frigate export API, after waiting for the export worker to settle
+    post-restart. Direct reads are ~10-100× faster and avoid the export
+    worker's quirks (§16), so mount it when you can.
 - Frigate's configured API, go2rtc, and RTSP endpoints must be reachable from
   the appliance; network topology is deployment-specific. The example publishes
   `8898` on host loopback only; configure bearer authentication before making it
@@ -667,16 +751,22 @@ here, PIL/numpy there), classification FIRST, per-class brightness second:
 
 ## 13b. Design invariant: zero added latency on live streaming (owner directive)
 
-The appliance must never interpose in the media path. Cameras → go2rtc →
-consumers stays byte-identical to a system without the appliance: no
-proxying, no re-streaming, no transcoding of live feeds, ever. Its standing
-footprint while privacy is off is an unused go2rtc template key, a read-only
-recordings mount, and a 20 s status poll. It touches streams only AT toggle
-time, changes only the selected config entries, and restores the exact original
-source strings (identical
-`nobuffer`/`low_delay` producer args). Any future design that routes live
-media THROUGH the appliance (e.g. an appliance-side RTSP relay) violates
-this contract.
+While privacy is OFF, the appliance must not interpose in the media path.
+Cameras → go2rtc → consumers stays byte-identical to a system without the
+appliance: no proxying, no re-streaming, no transcoding of live feeds. The
+standing footprint while privacy is off is an unused go2rtc template key, a
+read-only recordings mount, and a 20 s status poll. Toggles change only the
+selected config entries and restore the exact original source strings
+(identical `nobuffer`/`low_delay` producer args).
+
+Scope (amended 2026-07-14, owner directive): this invariant is ABSOLUTE and
+binds every backend, including the §18 proxy design. The appliance never
+interposes in a LIVE camera feed: it never accesses cameras (Frigate does), and
+`proxy-interpose` only ever serves local clip content, only while privacy is on
+— there is no live stream to delay while it is in the path, and `off` removes
+it from the path entirely. A standing/permanent restream layer that fronts the
+cameras full-time is out of scope precisely because it would violate this
+invariant.
 
 ## 14. Limitations / non-goals
 
@@ -685,13 +775,33 @@ this contract.
   activation is refused.
 - Recordings/detection during privacy contain the loop (that's the feature).
   Loop-seam motion blips possible in loop mode.
-- Every engage and restore performs a full Frigate restart (loop-mode engage
-  performs two — freeze, then the background loop upgrade) and therefore causes a
-  recording/availability gap while Frigate cold-boots each time.
+- Under the default `frigate-config` backend, every engage and restore performs
+  a full Frigate restart (loop-mode engage performs two — freeze, then the
+  background loop upgrade) and therefore causes a recording/availability gap
+  while Frigate cold-boots each time. The `proxy-interpose` backend (§18,
+  design) reduces this to one restart per direction, with loop updates as ~2 s
+  proxy respawns rather than a second restart.
 - No scheduling, no per-camera partial privacy UI, no auth beyond the bearer
   token, no built-in TLS (use an authenticated TLS reverse proxy when needed).
 - Frozen-frame clips re-encode once at capture (CPU seconds, one-off); loop
   mode never transcodes.
+- **Detectability bar: users in the dark, admins informed (guiding axiom, §1).**
+  The deception targets non-admin users, downstream video consumers, and
+  Frigate's own pipeline — none can tell privacy is active (§4.3). An operator,
+  by contrast, is meant to see it plainly (Déjà Vu's `status`/logs, and by
+  design an operator-facing indicator); there is deliberately no plausible
+  deniability against an admin, and forensic/host evidence (mtimes, encoder
+  fingerprints, the Docker/host restart record) is left intact. The only tells
+  suppressed are those a non-admin user could notice — chiefly the restart's
+  recording-timeline gap — closed by ELIMINATING the seam at its source
+  (restart-less swap §17.1/§18; content-side gap continuity §17.3), never by
+  scrubbing Frigate's logs/event DB, the host journal, or Docker's restart
+  record (cover-tracks/alibi work, a hard non-goal, and pointless when admins
+  are meant to see it). Good manners still apply in two senses —
+  *leave no trace* (surgical byte-identical restore, no needless config churn,
+  no orphaned clips) and *do not disturb the wildlife* (minimal collateral
+  disruption to live consumers, recordings, detection, and neighboring services
+  while operating) — as hygiene, not concealment.
 
 ## 15. Milestones
 
@@ -875,14 +985,292 @@ go2rtc 1.9.10 reference architecture in §2.
 
 ### 17.1 Hot swap without restarting Frigate
 
-Privacy sources replace the active camera sources without restarting Frigate or
-changing its stored configuration. Stream names and URLs remain stable so
-recording, detection, Birdseye, Home Assistant, and WebRTC continue across the
-transition. Switching privacy off restores the complete original source lists.
+Superseded by design: §18 (dejavu-owned go2rtc proxy backend). The
+`proxy-interpose` backend removes every restart except one per direction — loop
+updates become ~2 s proxy respawns.
 
 ### 17.2 Instant privacy
 
-Privacy engages as soon as every selected stream has a safe freeze frame. Loop
-discovery continues in the background, and each camera moves to its best safe
+SHIPPED as the two-stage engage (§5c): privacy
+engages as soon as every selected stream has a safe freeze frame; loop
+discovery continues in the background and each camera moves to its best safe
 loop when one becomes available. A camera with no suitable loop stays frozen,
 and privacy is never reported as active while a selected stream remains live.
+Under the `proxy-interpose` backend (§18) the loop upgrade additionally lands
+without a second Frigate restart.
+
+### 17.3 Switchover invisibility in the timeline (OPEN — content-side, not record erasure)
+
+Goal (§1): a non-admin scrubbing the recording timeline cannot LOCATE the
+switchover, in either direction — neither a gap nor a content jump marks where
+privacy engaged or disengaged. Two content-side components:
+
+1. **The gap.** Under the `frigate-config` backend each restart leaves a real
+   recording gap (~17 s cold-boot) that shows as a discontinuity in Frigate's
+   timeline. Open question: whether to backfill it on the CONTENT side — writing
+   loop/freeze segments across the hole so a timeline scrubber shows no break —
+   as an extension of what the tool already does (fabricate recorded content
+   while private).
+2. **The visual seam.** Engage already freezes on the current live frame, so the
+   live→privacy transition is visually continuous where the scene is quiet. The
+   inherent limits are the privacy→live disengage (the scene has since diverged)
+   and any real activity present at the engage instant — a genuine jump no replay
+   fully hides (best-effort there, per §1).
+
+Backfill is distinct from, and must never be conflated with, log/DB/journal
+scrubbing (§1, §14 non-goal): it *adds plausible content*, it does not *erase
+the record that the appliance acted*. Honest limit: it serves the §1
+user-opacity bar only — a non-admin scrubbing the timeline in ordinary viewing.
+Frigate's `recordings` rows, segment mtimes, and the post-hoc authoring still
+read as fabricated to an admin or forensic look (intended), and it does nothing
+about the Docker/host restart record. Seam elimination (§17.1/§18) is the real
+fix: if it lands there is no gap to backfill and the visual seam collapses to a
+single instantaneous swap. Not scheduled; recorded here so the goal is captured
+together with its boundary.
+
+## 18. Dejavu-owned go2rtc proxy backend (DESIGN — not implemented)
+
+Status: design only. Nothing in this section is built or verified except where
+explicitly marked; §18.7 lists the proofs required before implementation.
+
+### 18.1 Motivation and shape
+
+Every operational cost in this contract traces to one fact: the swap is
+effected by restarting Frigate. Owning a go2rtc instance moves the swap into a
+process the appliance controls, behind the same seam that today is
+`soft_restart()` (the two-stage "swap seam"). The appliance BUNDLES go2rtc as a
+supervised child process of its own container (no Docker socket, no host
+access, no sibling-container control needed — reloading the proxy is
+respawning our own child). Its native go2rtc config file is authored by the
+appliance directly; Frigate's `str.format` brace trap (§16) does NOT apply to
+it, so loop templates like `-re -stream_loop -1 -i {input}` are written
+plainly.
+
+Backend selection (proposed config):
+
+    swap:
+      backend: frigate-config     # default — current behavior (§4-§8)
+              | proxy-interpose   # §18.3
+    proxy:
+      rtsp_url: rtsp://frigate-dejavu:8554   # how FRIGATE reaches our go2rtc
+      api_url: http://127.0.0.1:1984          # how the appliance verifies it
+      # go2rtc binary path, stream port, and health probe are appliance-internal.
+
+Two hard scope invariants bound this design (owner directives, §13b):
+- The appliance NEVER accesses cameras. Cameras remain Frigate's alone; our
+  go2rtc only ever serves local clip files. IP-restricting cameras to the
+  Frigate host stays valid.
+- The appliance is NEVER a permanent proxy. It interposes only WHILE privacy is
+  on, for the selected streams only; `off` restores Frigate's original sources
+  and removes us from the media path entirely.
+A standing/always-in-path restream layer that fronts cameras is explicitly out
+of scope — it would require camera access and permanence, violating both.
+
+Both backends share: profiles, the freeze ladder, loop search/guards, clips at
+`<stream>.dejavu.mp4`, the state machine, `streams.json` restore records,
+debounce, and the REST/CLI surface. Only the apply mechanism differs.
+
+### 18.2 Proxy mechanics
+
+- The appliance writes its OWN go2rtc config: one stream per selected Frigate
+  stream name, each source an ffmpeg file-loop of that stream's
+  `<stream>.dejavu.mp4` clip (same fixed-path convention as today).
+- Apply = atomic config write + child-process respawn (~1-2 s). Frigate-side
+  consumers of our RTSP streams drop once and re-dial via Frigate's watchdog /
+  go2rtc on-demand redial — the same reconnect behavior cameras already
+  exhibit after a brief network blip. Promptness of the two-layer redial is
+  UNVERIFIED (§18.7-P1).
+- Loop promotion keeps the same-path trick: `os.replace` the loop over the
+  freeze clip, respawn the proxy. No config change, no Frigate involvement.
+  (`-stream_loop` holds its open inode, so a respawn — not just the file swap —
+  is required; per-producer kicks instead of a full respawn are an
+  optimization, §18.7-P4.)
+- Because updates are restart-free from Frigate's perspective, long sessions
+  can ROTATE their loops as the time of day drifts — the §19 previous-day
+  rotation is designed around exactly this economics (a rotation costs ~2 s
+  here vs a full Frigate restart under `frigate-config`).
+- Verification = our own `/api/streams` (producers serving, consumers attached
+  — an attached consumer proves Frigate is pulling). The appliance never needs
+  Frigate's API to verify content it serves itself.
+
+### 18.3 `proxy-interpose`: interpose only while private
+
+The one and only proxy backend, and the shape both §18.1 invariants permit. The
+appliance's go2rtc carries NO camera access — cameras may be IP-restricted to
+the Frigate host; the proxy serves only local clip files. It is in the media
+path only WHILE privacy is on, for selected streams only. §13b holds: the
+off-state media path is untouched, and while interposed there is no live stream
+to delay (only clips).
+
+Engage (replaces §6 steps 6-8 apply; everything before is unchanged):
+1. Prepare freeze clips per stream (ladder, §5c) and select loop windows —
+   both from Frigate's restream/API, BEFORE any swap, exactly as today.
+2. Write our go2rtc config serving every selected stream's clip; respawn;
+   verify our `/api/streams`.
+3. Rewrite Frigate's `go2rtc.streams`: each selected stream's source list
+   becomes the single interpose URL `rtsp://<proxy.rtsp_url>/<stream>`.
+   `streams.json` records `original_kind`/`original_sources` verbatim —
+   surgical restore (§7) is unchanged.
+4. ONE coordinated Frigate restart + verify (+ rollback), identical to today's
+   restart #1. Privacy is ON (freeze first, two-stage §5c).
+5. Stage-2 loop upgrades land via §18.2 promotion — restart #2 CEASES TO EXIST
+   (the second event is now a ~2 s proxy respawn, not a Frigate restart).
+
+Off: surgical restore + ONE coordinated Frigate restart (unchanged §7), then
+tear down our streams. Restore never depends on the proxy being alive.
+
+Failure while interposed: our container dying takes the SELECTED streams dark
+at Frigate (recording gap for those cameras until compose `restart: always`
+revives it — the clips and config are on disk, recovery is automatic).
+Unselected cameras are never touched. This bounded exposure — private streams
+only, only while private — is the price of restart-free upgrades; §13b's
+off-state guarantee is never at risk.
+
+### 18.4 Loop content sourcing
+
+| Source | frigate-config | proxy-interpose |
+|---|---|---|
+| `/recordings` direct reads | fast path | fast path |
+| Frigate export API | fallback (§5b) | fallback — UNIQUELY enables a fully decoupled deployment: no camera access, no recordings mount, network-only |
+
+Because the appliance never carries the live camera feed (§18.1: no camera
+access, clips only), sourcing loops from a rolling passthrough buffer is NOT
+available — loop content is always `/recordings` direct reads or the export
+API. Under `proxy-interpose` with export sourcing the appliance touches Frigate
+through exactly two channels: its REST API and one restart per direction.
+
+### 18.5 State machine and seam changes
+
+- `soft_restart(expect)` generalizes to the backend seam `apply_swap(expect)`:
+  `frigate-config` → coordinated restart (§8); `proxy-interpose` → §18.2 respawn
+  + self-verification. The observed-restart proof (§6 step 11) is replaced under
+  the proxy backend by consumer-attachment verification on our own API.
+- `upgrade_pid`/ownership-gate/off-cancel concurrency carries over unchanged;
+  stage 2 merely becomes cheap.
+- New states: none. New failure mapping: proxy respawn that never comes
+  healthy → `error` (streams dark is an outage, not a privacy regression —
+  Frigate still points at us and no live source is exposed).
+
+### 18.6 What each backend costs (summary)
+
+| | frigate restarts on/off | loop update | camera access | §13b | blast radius if appliance dies |
+|---|---|---|---|---|---|
+| frigate-config | 1-2 / 1 | frigate restart | never | holds | none (inert when idle) |
+| proxy-interpose | 1 / 1 | ~2 s respawn | never | holds | selected streams, only while ON |
+
+### 18.7 Proofs required before implementation (blocking)
+
+- P1: two-layer redial promptness — swap+respawn our go2rtc; measure how fast
+  Frigate's go2rtc → ffmpeg consumer chain re-dials and serves the new
+  content, and that no producer wedges (the §16 SetSource lesson, one layer
+  removed). Containerized PoC, no production Frigate required.
+- P2: interpose-URL adoption — Frigate config pointing at an external go2rtc
+  RTSP URL survives its config validator and one restart cycle (expected yes;
+  verify).
+- P3: bundled go2rtc supervision — child-process lifecycle inside the
+  appliance container (spawn, health, respawn, clean shutdown), version pinned
+  and shipped in the image.
+- P4: per-producer refresh without full respawn (optimization; P1 decides
+  whether it is even needed).
+- P5: RTSP exposure — our go2rtc port is reachable by Frigate; decide bind/auth
+  posture so clip streams are not world-readable on the LAN.
+
+## 19. Previous-day sourcing & time-period loop rotation (DESIGN — not implemented)
+
+Status: design only. This is the rolling-buffer idea reborn within the §18.1
+invariants: the appliance never carries the live feed, but Frigate's own
+recordings already hold "yesterday's stream" — so instead of buffering
+forward, look BACKWARD whole days. Lighting drifts continuously, so a session
+left on long enough goes stale by the clock: rotation re-sources every 90
+minutes (default) from a previous day at the current clock time, and the
+engage-time lookback was reduced 4 → 3 h (≈ one lighting period) so even the
+first loop is never sourced more than one period from "now".
+
+Risk posture (owner directive): this is BEST-EFFORT PLAUSIBILITY, not verified
+fidelity. Mid-session there is nothing real to verify against — the goal is
+content a viewer accepts as "now", assembled under every guard that still
+applies, and a rotation that finds nothing acceptable leaves the current clip
+standing. We do our best; we are never worse than the clip already serving.
+
+### 19.1 Previous-day candidate tier (engage-time)
+
+- In addition to the recent lookback (last `search_hours` ≤ 3 h), candidate
+  windows are also mined from previous days at the SAME clock time: for
+  `d = 1..previous_days`, the window around `now − 24 h·d`. Nearest day first,
+  DESCENDING day by day until a guarded window lands — yesterday's hour may
+  have been rainy, private (§19.3), or busy; the day before often is not.
+- Same-clock-time sourcing is the point: sun geometry is near-identical at
+  the same time on an adjacent day, and the footage carries its own correct
+  IR state (a camera that was in IR at this clock time yesterday almost
+  certainly is today). Every existing guard still applies — at engage a live
+  reference exists, so the vs-now brightness and IR-mode guards screen
+  previous-day candidates exactly like recent ones; day-over-day weather
+  change is precisely what they catch. Event/person, dilution, drift, and
+  seam guards are unchanged.
+- Ranking: previous-day windows join the pool as an older recency bucket
+  under the existing tier-first ordering — so a QUIET window from yesterday
+  at this hour outranks a diluted or short window from the busy last hour.
+  This materially raises loop success on cameras that are busy whenever
+  someone is home to toggle privacy.
+- Export-path synergy (§18.4): previous-day windows sit far outside every
+  export freshness margin — the safest possible export candidates, which is
+  exactly what the decoupled deployment needs.
+- Retention bounds the descent naturally: only days whose segments AND event
+  metadata still exist are searched (fewer retained days = shorter descent;
+  zero = the recent lookback stands alone — graceful).
+
+### 19.2 Rotation across periods (long sessions)
+
+- Motivation: a loop engaged at 13:00 is a lie by 19:00 — wrong sun, wrong
+  shadows, possibly wrong IR mode. `search_hours: 3` bounds that staleness at
+  engage; rotation extends the bound across arbitrarily long sessions, keeping
+  playback within ~90 minutes of the true clock.
+- Every `rotation.period_minutes` (default 90, rolling from engage), the
+  appliance re-runs the stage-2 pipeline anchored to "a previous day at the
+  CURRENT clock time": select windows around `now − 24 h·d` (descending days,
+  as §19.1), assemble, guard, promote onto the same `<stream>.dejavu.mp4`
+  paths, and land them through the swap seam. One shared previous-day anchor
+  keeps overlapping cameras rotating to the same moment (§5b sync).
+- Mid-session there is NO live reference — the cameras are not being pulled,
+  and `latest.jpg` shows the loop. The vs-now lighting guard is therefore
+  unavailable; time-of-day alignment IS the lighting guard, and the recorded
+  footage carries its own IR state. Intra-window drift, event/person,
+  dilution, and seam guards still apply in full. Residual accepted risk:
+  day-over-day weather change — best-effort plausibility by design (see the
+  risk posture above); an optional tolerant sanity check against the OUTGOING
+  loop's endpoint stats is an open item.
+- Cost per rotation: `proxy-interpose` ≈ 2 s respawn (the designed home,
+  §18.2); `frigate-config` = one full coordinated restart per boundary —
+  permitted but discouraged and off by default there.
+- Execution: the long-lived API service schedules an internal `dejavu rotate`
+  transition while `state == on`. It reuses the stage-2 machinery verbatim —
+  `upgrade_pid` marker, ownership gate, `off` cancels it and wins, budget
+  bound, and the never-less-private rule: any failure (no guarded window, a
+  stream's search timing out, the swap not landing) leaves the CURRENT clips
+  standing. A rotation is an upgrade of a private stream to a fresher private
+  stream, nothing else.
+
+### 19.3 Never loop a loop (session-history exclusion)
+
+Footage recorded while dejavu was ON is loop/freeze content; sourcing it would
+compound copies of copies and can resurrect a stale scene. The appliance
+persists an append-only session log (`state/sessions.log`: engage/restore
+timestamps, written where the state file already transitions), and every
+candidate window — recent, previous-day, or rotation — overlapping ANY logged
+ON interval is excluded before ranking. This also excludes the current
+session's own recordings during rotation by construction. History before the
+log existed is treated as clean (the content guards still screen it).
+
+### 19.4 Proposed configuration
+
+    capture:
+      recordings:
+        search_hours: 3       # recent lookback ≈ one lighting period (SHIPPED)
+        previous_days: 7      # same-clock-time days to descend through; 0 disables
+      rotation:
+        enabled: false        # design; intended default true under proxy-interpose
+        period_minutes: 90
+
+Open items: rotation-vs-debounce interplay; whether the outgoing-loop
+endpoint-stats sanity check earns its complexity; retention shorter than
+`previous_days` (degrades to however many days exist — verify gracefully).

@@ -58,7 +58,7 @@ DEFAULTS = {
         # already guaranteed. 0 = unbounded (still cancellable by 'off').
         "loop_assembly_budget_seconds": 900,
         "recordings": {
-            "search_hours": 4,
+            "search_hours": 3,
             "min_seconds": 20,
             "audio": "silence",
             "max_brightness_delta": 60,

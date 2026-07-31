@@ -277,9 +277,8 @@ class RestartTests(unittest.TestCase):
 
 
 class LoopSearchDeadlineTests(unittest.TestCase):
-    """The loop search runs while cameras are still live, so it is bounded: a
-    stream that has not found a loop by the deadline engages on its freeze clip
-    instead of holding privacy back for a slow scan."""
+    """Privacy is already on via freeze while stage 2 runs, but loop assembly is
+    still bounded so a slow export or scan cannot run forever."""
 
     def test_any_cancel_follows_its_source(self):
         source = core.CancelToken()
@@ -324,6 +323,26 @@ class LoopSearchDeadlineTests(unittest.TestCase):
         finally:
             pool.shutdown(wait=True)
         self.assertEqual({"fast"}, set(upgrades))  # slow stream stays on freeze
+        self.assertTrue(cancel.cancelled)
+
+    def test_time_spent_before_collection_counts_against_budget(self):
+        cancel = core._AnyCancel()
+        pool = ThreadPoolExecutor(max_workers=1)
+
+        def cooperative_search():
+            while not cancel.cancelled:
+                time.sleep(0.01)
+            raise core.Cancelled()
+
+        started = time.monotonic() - 1
+        try:
+            futures = {"cam": pool.submit(cooperative_search)}
+            upgrades = core._collect_upgrades(
+                futures, {"cam"}, cancel, 0.2, budget_started_at=started
+            )
+        finally:
+            pool.shutdown(wait=True)
+        self.assertEqual({}, upgrades)
         self.assertTrue(cancel.cancelled)
 
 
@@ -444,7 +463,7 @@ class TwoStageEngageTests(unittest.TestCase):
                 "cam": {"clip_source": "recordings", "rung": "loop", "mode": "loop"}
             }
 
-            def fake_collect(futures, allowed, cancel, budget):
+            def fake_collect(futures, allowed, cancel, budget, budget_started):
                 cancel.cancel()  # simulate the budget timer firing during collect
                 return {"cam": {"clip": "x"}}
 
@@ -566,6 +585,157 @@ class TwoStageEngageTests(unittest.TestCase):
             with self.assertRaises(core.Busy) as ctx:
                 core.preflight(cfg, "off")
         self.assertNotIn("busy:", str(ctx.exception).lower())
+
+
+class LoopSourcingTests(unittest.TestCase):
+    """Loop sourcing: export fallback when /recordings is not readable, and
+    freeze-frame lighting references carried for offline (non-black) rungs."""
+
+    def _cfg(self):
+        cfg = load_example_config()
+        cfg["paths"]["recordings_dir"] = "/nonexistent-recordings"
+        return cfg
+
+    def test_no_mount_uses_export_api_after_settle(self):
+        cfg = self._cfg()
+        engaged = {"cam": {"ref": {"luma": 1}, "has_audio": False}}
+        plan = {"cam": {}}
+        with mock.patch.object(
+            core.recordings_mod, "files_retrieval_available", return_value=False
+        ), mock.patch.object(
+            core.recordings_mod, "wait_exports_ready", return_value=True
+        ) as settle, mock.patch.object(
+            core, "_make_upgrade_task", return_value=lambda: None
+        ):
+            cancel = core.CancelToken()
+            gate = core._ExportReadyGate(
+                cfg["frigate"]["api_url"],
+                cfg["frigate"]["settle_timeout_seconds"],
+                cancel,
+            )
+            pool, futures = core._start_upgrades(
+                cfg, {}, mock.Mock(), mock.Mock(), plan, engaged, cancel, gate
+            )
+        try:
+            settle.assert_called_once()  # export path gated on the settle check
+            self.assertEqual({"cam"}, set(futures))  # search STILL runs (exports)
+        finally:
+            if pool:
+                pool.shutdown(wait=True)
+
+    def test_no_mount_and_unsettled_exports_stays_on_freeze(self):
+        cfg = self._cfg()
+        engaged = {"cam": {"ref": {"luma": 1}, "has_audio": False}}
+        with mock.patch.object(
+            core.recordings_mod, "files_retrieval_available", return_value=False
+        ), mock.patch.object(
+            core.recordings_mod, "wait_exports_ready", return_value=False
+        ):
+            cancel = core.CancelToken()
+            gate = core._ExportReadyGate(
+                cfg["frigate"]["api_url"],
+                cfg["frigate"]["settle_timeout_seconds"],
+                cancel,
+            )
+            pool, futures = core._start_upgrades(
+                cfg, {}, mock.Mock(), mock.Mock(), {"cam": {}}, engaged, cancel, gate
+            )
+        self.assertIsNone(pool)
+        self.assertEqual({}, futures)
+
+    def test_export_gate_is_shared_and_capped_by_remaining_budget(self):
+        cancel = core._AnyCancel()
+        with (
+            mock.patch.object(core.time, "monotonic", return_value=100),
+            mock.patch.object(
+                core.recordings_mod, "wait_exports_ready", return_value=True
+            ) as wait,
+        ):
+            gate = core._ExportReadyGate("api", 30, cancel, deadline=103)
+            self.assertTrue(gate.wait())
+            self.assertTrue(gate.wait())
+
+        wait.assert_called_once_with("api", 3, cancel)
+
+    def test_readiness_poll_itself_does_not_overrun_its_timeout(self):
+        with (
+            mock.patch.object(
+                recordings.time,
+                "monotonic",
+                side_effect=[100, 100.2, 100.8, 101.0],
+            ),
+            mock.patch.object(
+                recordings, "exports_api_ready", return_value=False
+            ) as ready,
+            mock.patch.object(recordings.time, "sleep") as sleep,
+        ):
+            self.assertFalse(recordings.wait_exports_ready("api", 1))
+
+        self.assertAlmostEqual(0.8, ready.call_args.kwargs["timeout"])
+        self.assertAlmostEqual(0.2, sleep.call_args.args[0])
+
+    def test_actual_export_fallback_checks_readiness_before_starting(self):
+        ready = mock.Mock(return_value=False)
+        progress = mock.Mock()
+        win = {"start": 10, "end": 20, "duration": 10, "tier": 0}
+        with (
+            mock.patch.object(
+                recordings, "files_retrieval_available", return_value=False
+            ),
+            mock.patch.object(recordings, "start_export") as start,
+        ):
+            with self.assertRaisesRegex(
+                recordings.CaptureError, "did not become ready"
+            ):
+                recordings._fetch_window_clip(
+                    "api",
+                    "camera",
+                    "stream",
+                    win,
+                    "/tmp",
+                    None,
+                    progress,
+                    100,
+                    export_ready=ready,
+                )
+
+        ready.assert_called_once_with()
+        start.assert_not_called()
+
+    def test_only_black_rung_is_skipped(self):
+        cfg = load_example_config()
+        engaged = {
+            "live_cam": {"ref": {"luma": 1}, "has_audio": False},
+            "offline_cam": {"ref": {"luma": 2}, "has_audio": False},  # rung 2/3
+            "black_cam": {"ref": None, "has_audio": False},  # rung 4
+        }
+        plan = {s: {} for s in engaged}
+        with (
+            mock.patch.object(
+                core.recordings_mod, "files_retrieval_available", return_value=True
+            ),
+            mock.patch.object(
+                core.recordings_mod, "wait_exports_ready"
+            ) as wait,
+            mock.patch.object(
+                core, "_make_upgrade_task", return_value=lambda: None
+            ),
+        ):
+            cancel = core.CancelToken()
+            gate = core._ExportReadyGate(
+                cfg["frigate"]["api_url"],
+                cfg["frigate"]["settle_timeout_seconds"],
+                cancel,
+            )
+            pool, futures = core._start_upgrades(
+                cfg, {}, mock.Mock(), mock.Mock(), plan, engaged, cancel, gate
+            )
+        try:
+            self.assertEqual({"live_cam", "offline_cam"}, set(futures))
+            wait.assert_not_called()  # direct fast path is not delayed by exports
+        finally:
+            if pool:
+                pool.shutdown(wait=True)
 
 
 class ExportLifecycleTests(unittest.TestCase):

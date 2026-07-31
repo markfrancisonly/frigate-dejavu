@@ -715,7 +715,8 @@ def _freeze_and_cache(cfg, job, stream, png, src_meta, reference=False):
 
 def _engage_freeze(cfg, req, job, store, stream, meta):
     """Rungs 1-4. Always returns a result; raises only on cancellation.
-    On the live rung it also carries `ref` — the frame's lighting stats."""
+    Every imagery rung also carries `ref` — the frame's lighting stats; only
+    the synthetic black rung has no reference and cannot upgrade to a loop."""
     cap, paths = cfg["capture"], cfg["paths"]
     api = cfg["frigate"]["api_url"].rstrip("/")
     query = f"?{cap['rtsp_query']}" if cap["rtsp_query"] else ""
@@ -766,13 +767,18 @@ def _engage_freeze(cfg, req, job, store, stream, meta):
                 store.update_stream,
                 recordings_dir=paths["recordings_dir"],
             )
-            result, _ = _freeze_and_cache(cfg, job, stream, png, src_meta)
+            # The recorded frame IS what this offline camera shows, so it is
+            # also the lighting reference a loop must match (there is no live
+            # appearance to diverge from).
+            result, ref = _freeze_and_cache(
+                cfg, job, stream, png, src_meta, reference=True
+            )
             return {
                 **result,
                 "clip_source": "recordings",
                 "rung": "recorded",
                 "window": window,
-                "ref": None,
+                "ref": ref,
             }
         except capture_mod.CaptureError as exc:
             reasons.append(f"recordings: {exc}")
@@ -792,11 +798,17 @@ def _engage_freeze(cfg, req, job, store, stream, meta):
             result = _freeze_from_png(
                 cfg, job, stream, cached, cached_meta or capture_mod.PLACEHOLDER_META
             )
+            # The cached frame is what viewers will see, so it doubles as the
+            # loop guard reference; an unreadable frame just means no loop.
+            try:
+                ref = recordings_mod.frame_stats(cached, job.cancel)
+            except capture_mod.CaptureError:
+                ref = None
             return {
                 **result,
                 "clip_source": "cache",
                 "rung": "cached",
-                "ref": None,
+                "ref": ref,
                 "degraded": "; ".join(reasons),
             }
         except capture_mod.CaptureError as exc:
@@ -856,7 +868,9 @@ def _make_freeze_task(cfg, req, job, store, stream, meta):
     return task
 
 
-def _make_upgrade_task(cfg, req, job, store, stream, meta, ref, want_audio, cancel):
+def _make_upgrade_task(
+    cfg, req, job, store, stream, meta, ref, want_audio, cancel, export_ready=None
+):
     """Stage a loop from this stream's recent past for atomic promotion.
 
     Returns None when nothing beats the freeze frame. `cancel` bounds the search
@@ -892,7 +906,7 @@ def _make_upgrade_task(cfg, req, job, store, stream, meta, ref, want_audio, canc
                 max_seconds=cap["max_loop_seconds"],
                 want_audio=want_audio,
                 out_path=part,
-                files_only=True,
+                export_ready=export_ready,
             )
             return {**result, "clip_source": "recordings", "rung": "loop"}
         except capture_mod.CaptureError as exc:
@@ -937,7 +951,7 @@ def _log_ladder(results):
 
 
 # --------------------------------------------------------------------------
-# pre-activation loop search and atomic promotion
+# loop-upgrade cancellation, search, and atomic promotion
 # --------------------------------------------------------------------------
 
 
@@ -976,61 +990,125 @@ class _AnyCancel:
         self._own.cancel()
 
 
-def _start_upgrades(cfg, req, job, store, plan, engaged, cancel):
-    """Stage 2: kick off one background loop search per live-rung stream. The
-    clips are staged, not published — promotion happens under _promote_upgrades.
-    Runs entirely from local recordings (NO Frigate API): the candidate windows
-    were selected before restart #1 and each stream carries its own freeze-frame
-    reference, so a stream without a carried reference (offline / black rung) is
-    simply left on its freeze clip."""
+class _ExportReadyGate:
+    """One readiness wait shared by every stage-2 export fallback.
+
+    Direct recording reads stay fast and never touch this gate.  The first task
+    that actually needs Frigate's post-restart export worker performs the wait;
+    later tasks reuse its result.  The wait is capped by both Frigate's settle
+    timeout and the remaining overall loop-assembly budget.
+    """
+
+    def __init__(self, api, settle_timeout, cancel, deadline=None):
+        self.api = api
+        self.settle_timeout = settle_timeout
+        self.cancel = cancel
+        self.deadline = deadline
+        self._lock = threading.Lock()
+        self._ready = None
+
+    def wait(self):
+        with self._lock:
+            if self._ready is not None:
+                return self._ready
+            timeout = self.settle_timeout
+            if self.deadline is not None:
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    self.cancel.cancel()
+                    self._ready = False
+                    return False
+                timeout = min(timeout, remaining)
+            self._ready = recordings_mod.wait_exports_ready(
+                self.api, timeout, self.cancel
+            )
+            return self._ready
+
+
+def _start_upgrades(cfg, req, job, store, plan, engaged, cancel, export_gate):
+    """Kick off one loop search per stream. The clips are staged, not published —
+    promotion happens under _promote_upgrades. Candidate windows were selected up
+    front while Frigate was up, and every non-black freeze carries its own
+    lighting reference, so only the black rung (no imagery at all) is skipped.
+    Direct segment reads are preferred; without a readable mount the searches
+    ride the (serialized) export API, gated on the export worker actually
+    answering — it lags minutes behind a Frigate restart. The caller supplies
+    `export_gate`, which owns the loop-assembly budget/deadline the wait must
+    fit inside (this function has no budget context to build a bounded one)."""
+    eligible = [
+        (stream, meta)
+        for stream, meta in plan.items()
+        if engaged.get(stream) and engaged[stream].get("ref") is not None
+    ]
+    if not eligible:
+        return None, {}
+
     paths = cfg["paths"]
     if not recordings_mod.files_retrieval_available(paths["recordings_dir"]):
-        # Direct segment reads are what keep stage 2 API-free after the restart;
-        # without them the only source is the export API, which lags minutes
-        # post-restart. Skip the upgrade and keep the freeze baseline.
-        log.info(
-            "recordings not directly readable at %s — skipping the loop upgrade; "
-            "streams stay on their freeze frames",
-            paths["recordings_dir"],
-        )
-        return None, {}
-    log.info("retrieval: direct segment reads from %s", paths["recordings_dir"])
+        if not export_gate.wait():
+            log.warning(
+                "frigate export API never settled — no loop sourcing this "
+                "session; streams stay on their freeze frames"
+            )
+            return None, {}
+        log.info("retrieval: frigate export API (recordings not directly readable)")
+    else:
+        log.info("retrieval: direct segment reads from %s", paths["recordings_dir"])
 
     pool = ThreadPoolExecutor(
         max_workers=max(1, cfg["capture"]["parallel"]), thread_name_prefix="upgrade"
     )
     futures = {}
-    for stream, meta in plan.items():
-        r = engaged.get(stream)
-        if not r or r.get("ref") is None:
-            continue  # offline / black rung: no live reference, stays on freeze
+    for stream, meta in eligible:
+        r = engaged[stream]
         task = _make_upgrade_task(
-            cfg, req, job, store, stream, meta, r.get("ref"), r["has_audio"], cancel
+            cfg,
+            req,
+            job,
+            store,
+            stream,
+            meta,
+            r["ref"],
+            r["has_audio"],
+            cancel,
+            export_ready=export_gate.wait,
         )
         futures[stream] = pool.submit(task)
-    log.info(
-        "searching for loop windows on %d stream(s) in the background", len(futures)
-    )
+    log.info("searching for loop windows on %d stream(s)", len(futures))
     return pool, futures
 
 
 _COLLECT_GRACE_SECONDS = 15  # let a cancelled search wind down before abandoning it
 
 
-def _collect_upgrades(futures, allowed, cancel, deadline_seconds):
+def _collect_upgrades(
+    futures, allowed, cancel, deadline_seconds, budget_started_at=None
+):
     """Harvest the loop searches, bounded by `deadline_seconds` as a WALL-CLOCK
     budget: when it expires the timer trips `cancel` (which kills in-flight ffmpeg,
     including any started just after — see CancelToken.register), and a straggler
     that does not wind down within a short grace is ABANDONED rather than waited on
     (its stream stays on the freeze clip already on disk). deadline_seconds <= 0
-    waits with no budget (searches still stop on the job cancel)."""
+    waits with no budget (searches still stop on the job cancel). When
+    `budget_started_at` is supplied, time already spent waiting for Frigate's
+    export worker counts against the same budget."""
     hard = None
     timer = None
     if deadline_seconds and deadline_seconds > 0:
-        hard = time.monotonic() + deadline_seconds + _COLLECT_GRACE_SECONDS
-        timer = threading.Timer(deadline_seconds, cancel.cancel)
-        timer.daemon = True
-        timer.start()
+        started = (
+            budget_started_at
+            if budget_started_at is not None
+            else time.monotonic()
+        )
+        deadline = started + deadline_seconds
+        hard = deadline + _COLLECT_GRACE_SECONDS
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining:
+            timer = threading.Timer(remaining, cancel.cancel)
+            timer.daemon = True
+            timer.start()
+        else:
+            cancel.cancel()
     upgrades = {}
     try:
         for stream, fut in futures.items():
@@ -1178,17 +1256,27 @@ def _run_loop_upgrade(cfg, job, req, plan, engaged, record, replacements, sessio
     pool = None
     try:
         budget = cfg["capture"]["loop_assembly_budget_seconds"]
+        budget_started = time.monotonic()
+        deadline = budget_started + budget if budget and budget > 0 else None
+        export_gate = _ExportReadyGate(
+            cfg["frigate"]["api_url"].rstrip("/"),
+            cfg["frigate"]["settle_timeout_seconds"],
+            search_cancel,
+            deadline,
+        )
         pool, futures = _start_upgrades(
-            cfg, req, job, store, plan, engaged, search_cancel
+            cfg, req, job, store, plan, engaged, search_cancel, export_gate
         )
         if not futures:
-            return  # offline-only, or recordings not directly readable
+            return  # black-only plan, or the export API never settled
         log.info(
             "stage 2: assembling loops in the background (budget %s); privacy is "
             "already ON via freeze",
             f"{budget}s" if budget else "unbounded",
         )
-        upgrades = _collect_upgrades(futures, replacements, search_cancel, budget)
+        upgrades = _collect_upgrades(
+            futures, replacements, search_cancel, budget, budget_started
+        )
 
         # Promote + claim the restart under the lock, ownership-gated so a
         # concurrent 'off' (which flips state to 'restoring') always wins: it
@@ -1406,7 +1494,7 @@ def cmd_on(
         # upgrades them to loops in the background afterward. The loop-WINDOW
         # selection is the only API-dependent step, so do it here — Frigate is up
         # and cameras are live — and stash the candidates on `plan`; stage 2 then
-        # assembles purely from local recordings after the restart.
+        # assembles the loops after the restart.
         want_loops = (
             req["mode"] == "loop"
             and req["source"] == "recordings"

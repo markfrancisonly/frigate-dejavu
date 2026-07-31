@@ -12,12 +12,13 @@ These files are designed to accompany the repository's
 [`compose.example.yaml`](../compose.example.yaml):
 
 - `config.example.yaml` defines the `perimeter`, `indoor`, and `all` profiles.
-- `compose.example.yaml` publishes the Dejavu API on port `8898` and leaves API
-  authentication disabled by default.
-- The Home Assistant examples connect to
-  `http://frigate-dejavu:8898`. The hostname must resolve to the Docker
-  host from Home Assistant; change it in `rest.yaml` and `rest_command.yaml` if
-  the host uses a different name or address.
+- `compose.example.yaml` binds the host port to loopback and joins the external
+  Frigate Docker network. API authentication is disabled by default.
+- The Home Assistant examples connect to `http://frigate-dejavu:8898`, so a
+  containerized Home Assistant must join that same external network. If Home
+  Assistant is remote, configure a bearer token or authenticated reverse proxy
+  before making the API LAN-routable, then change the URLs in `rest.yaml` and
+  `rest_command.yaml`.
 
 The example profiles map directly to the selector:
 

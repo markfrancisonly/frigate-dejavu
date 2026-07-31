@@ -1,10 +1,11 @@
 """Loop/freeze clip sourcing from Frigate's own recordings (SPEC §5b).
 
-Dejavu first prepares a live freeze frame (SPEC §5c); this module finds a
-better replacement before activation: a window of the camera's own recent past
-that can be looped without a human noticing. Absolute quiet is the ideal, but the thing
-that actually gives a loop away is REPETITION — so a long window in which a
-car passes once beats a short window in which a bush sways every 20 s.
+Dejavu first prepares a freeze frame (SPEC §5c); this module can source an
+offline camera's recorded freeze rung and, after freeze activation, find a
+better loop replacement from the camera's own recent past. Absolute quiet is
+the ideal, but the thing that actually gives a loop away is REPETITION — so a
+long window in which a car passes once beats a short window in which a bush
+sways every 20 s.
 
 Window tiers, best first (SPEC §5b.2):
   quiet    — every covering segment reports objects == 0 AND overlaps no event
@@ -92,10 +93,16 @@ def wait_exports_ready(api, timeout, cancel=None, progress=None):
     """Poll until the export API answers; True if ready within timeout."""
     deadline = time.monotonic() + timeout
     logged = False
-    while time.monotonic() < deadline:
+    while True:
         if cancel:
             cancel.check()
-        if exports_api_ready(api):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # The readiness probe and retry sleep must fit inside the caller's
+        # budget too.  An 8-second probe or fixed 5-second sleep after a short
+        # remaining deadline otherwise makes this "bounded" wait overrun it.
+        if exports_api_ready(api, timeout=min(8, remaining)):
             if logged:
                 log.info("frigate export API is responsive — proceeding")
             return True
@@ -108,8 +115,7 @@ def wait_exports_ready(api, timeout, cancel=None, progress=None):
             if progress:
                 progress("*", "waiting for frigate to settle")
             logged = True
-        time.sleep(5)
-    return False
+        time.sleep(min(5, max(0, deadline - time.monotonic())))
 
 
 def fetch_segments(api, camera, after, before):
@@ -881,7 +887,16 @@ def live_reference_stats(api, camera, tmp_dir, cancel, recordings_dir=None):
 
 
 def _fetch_window_clip(
-    api, camera, stream, win, tmp_dir, cancel, progress, now, recordings_dir=None
+    api,
+    camera,
+    stream,
+    win,
+    tmp_dir,
+    cancel,
+    progress,
+    now,
+    recordings_dir=None,
+    export_ready=None,
 ):
     """Fetch one candidate window: direct segment reads when available,
     else the (serialized) export API. Caller owns the returned tmp file."""
@@ -896,6 +911,14 @@ def _fetch_window_clip(
             )
     progress(stream, "waiting for export slot")
     with _EXPORT_LOCK:
+        if cancel:
+            cancel.check()
+        # Stage 2 runs immediately after Frigate restart #1.  The main API can
+        # be healthy while its export worker is still unavailable, so every
+        # actual export fallback (including one reached after a failed direct
+        # read) goes through the run's shared, one-time readiness gate.
+        if export_ready is not None and not export_ready():
+            raise CaptureError("frigate export API did not become ready in time")
         if cancel:
             cancel.check()
         progress(stream, f"exporting {describe_window(win, now)}")
@@ -1243,7 +1266,18 @@ def _exportable_windows(wins, now, reasons):
 
 
 def _from_exports(
-    api, camera, stream, wins, tmp_dir, cancel, progress, now, reasons, process, failure
+    api,
+    camera,
+    stream,
+    wins,
+    tmp_dir,
+    cancel,
+    progress,
+    now,
+    reasons,
+    process,
+    failure,
+    export_ready=None,
 ):
     """Fetch guarded candidates serially, cleaning each temporary export."""
     wins = _exportable_windows(wins, now, reasons)[:MAX_EXPORT_CANDIDATES]
@@ -1262,6 +1296,7 @@ def _from_exports(
                 progress,
                 now,
                 recordings_dir=None,
+                export_ready=export_ready,
             )
             return process(clip, win)
         except CaptureError as exc:
@@ -1424,7 +1459,7 @@ def source_clip_from_recordings(
     max_seconds=None,
     want_audio=None,
     out_path=None,
-    files_only=False,
+    export_ready=None,
 ):
     """Loop-clip pipeline: candidate windows -> lighting guards (vs-now AND
     intra-window drift: a clip spanning dawn/dusk pulses every loop) -> stitch
@@ -1559,12 +1594,6 @@ def source_clip_from_recordings(
             raise CaptureError(reason)
         return finish(clip, win)
 
-    if files_only:
-        # Stage 2 runs after restart #1, when the export API lags minutes behind;
-        # keep it purely file-based — no direct loop just means stay on freeze.
-        raise CaptureError(
-            "no direct-file loop; export fallback suppressed (file-only stage)"
-        )
     return _from_exports(
         api,
         camera,
@@ -1577,4 +1606,5 @@ def source_clip_from_recordings(
         reasons,
         use_export,
         "no lighting-stable loopable window",
+        export_ready=export_ready,
     )
