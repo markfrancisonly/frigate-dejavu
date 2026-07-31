@@ -41,8 +41,9 @@ capture:
   # restart (prompt, guaranteed), then loops are assembled in the background and
   # swapped in via a second restart (bounded by loop_assembly_budget_seconds). A
   # stream is NEVER left live; one that never finds a loop stays frozen forever —
-  # a success, not a failure. The opt-in restream loop source directly captures
-  # live video and aborts if capture fails.
+  # a success, not a failure. Loops read the /recordings mount directly when
+  # available, else fall back to Frigate's export API. The opt-in restream loop
+  # source directly captures live video and aborts if capture fails.
   source: recordings          # recordings (loop search sourced from Frigate's own
                               #   recordings) | restream (loop from a live capture)
   seconds: 300                # target loop length. LONGER is better: a car passing
@@ -61,9 +62,9 @@ capture:
                               #   on; a stream without a loop in time stays frozen
                               #   permanently. 0 = unbounded (still cancellable).
   recordings:
-    search_hours: 4           # lookback limit for the loop search — bounded "within
-                              #   reason"; the brightness guards police lighting
-                              #   staleness inside the window
+    search_hours: 3           # recent-past lookback for the loop search — about
+                              #   one lighting period (SPEC §19), so a sourced loop
+                              #   is never engaged more than one period stale
     min_seconds: 20           # busy cams: shortest acceptable quiet loop when no
                               #   full-length window exists
     audio: silence            # silence (default: no repeating-sound loop tell) | keep | strip

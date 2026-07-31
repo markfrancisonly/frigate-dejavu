@@ -5,7 +5,7 @@
 # two things to customize:
 #   1. the host paths to your Frigate config + recordings dirs
 #   2. the Docker network your Frigate container is on
-# Then:   docker compose up -d --build
+# Then:   docker compose up -d
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -43,4 +43,12 @@ services:
       - /path/to/frigate/recordings:/recordings:ro
 
     ports:
-      - "8898:8898"
+      - "127.0.0.1:8898:8898"
+
+    networks:
+      - frigate-network
+
+networks:
+  frigate-network:
+    name: frigate                    # EDIT: Frigate's external Docker network
+    external: true
