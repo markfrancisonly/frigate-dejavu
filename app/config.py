@@ -26,14 +26,15 @@ DEFAULTS = {
         "health_timeout_seconds": 300,
         "settle_timeout_seconds": 240,
         # Optional credentials for Frigate's AUTHENTICATED API port (8971).
-        # The default internal :5000 port needs none. token wins over
-        # user/password; user/password performs /api/login and rides the JWT
-        # cookie, re-logging in once on 401.
+        # The default internal :5000 port needs none. user/password drives
+        # frigate's own login; headers suit a frigate fronted by a proxy
+        # (auth.enabled false), where identity arrives as request headers.
         "api_auth": {
-            "token": "",
             "user": "",
             "password": "",
+            "headers": {},
         },
+        "tls_verify": True,
     },
     "paths": {
         "clips_local": "/clips",
@@ -143,6 +144,25 @@ def _str_list(value, path):
         )
 
 
+def _tls_verify(value):
+    if isinstance(value, bool):
+        return value
+    _require(
+        isinstance(value, str), "frigate.tls_verify", "must be a boolean or a path"
+    )
+    text = value.strip()
+    if not text:
+        return True
+    if text.lower() in ("true", "false"):
+        return text.lower() == "true"
+    _require(
+        text.startswith("/"),
+        "frigate.tls_verify",
+        f"must be true, false, or an absolute CA bundle path (got {value!r})",
+    )
+    return text
+
+
 def validate(cfg):
     f = cfg["frigate"]
     for key in ("api_url", "go2rtc_api_url", "restream_url"):
@@ -155,7 +175,7 @@ def validate(cfg):
     _int_value(cfg, "frigate.settle_timeout_seconds")
 
     auth = cfg["frigate"].get("api_auth") or {}
-    for key in ("token", "user", "password"):
+    for key in ("user", "password"):
         _require(
             isinstance(auth.get(key, ""), str),
             f"frigate.api_auth.{key}",
@@ -166,6 +186,17 @@ def validate(cfg):
         "frigate.api_auth",
         "password requires user",
     )
+    headers = auth.get("headers") or {}
+    _require(
+        isinstance(headers, dict), "frigate.api_auth.headers", "must be a mapping"
+    )
+    for name, value in headers.items():
+        _require(
+            isinstance(name, str) and name.strip() and isinstance(value, str),
+            f"frigate.api_auth.headers.{name}",
+            "must be a non-empty name with a string value",
+        )
+    f["tls_verify"] = _tls_verify(f.get("tls_verify", True))
 
     for key in (
         "clips_local",

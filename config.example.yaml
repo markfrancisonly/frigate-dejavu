@@ -19,9 +19,16 @@ frigate:
                                           # frigate's export API to answer — it lags
                                           # /api/version by minutes after a restart
   api_auth:                               # optional — only when api_url targets Frigate's
-    token: "{DEJAVU_FRIGATE_TOKEN}"       #   authenticated port (8971). Token wins;
-    user: "{DEJAVU_FRIGATE_USER}"         #   otherwise user/password logs in via
-    password: "{DEJAVU_FRIGATE_PASSWORD}" #   /api/login and rides the JWT cookie
+    user: "{DEJAVU_FRIGATE_USER}"         #   authenticated port (8971); logs in via
+    password: "{DEJAVU_FRIGATE_PASSWORD}" #   /api/login and re-logs in on a 401
+    headers: {}                           # instead of user/password when frigate runs
+                                          #   auth.enabled:false behind an authenticating
+                                          #   proxy — identity arrives as headers, e.g.
+                                          #   X-Proxy-Secret + the mapped user/role ones.
+                                          #   Static, so unlike a JWT it never expires.
+  tls_verify: true                        # false, or a CA bundle path. 8971 is HTTPS and
+                                          #   frigate's default cert is self-signed, so
+                                          #   leaving this true fails the handshake
 
 # Container-internal paths — these pair with the volume mounts in compose.yaml;
 # leave them unless you changed the right-hand (container) side of a mount there.

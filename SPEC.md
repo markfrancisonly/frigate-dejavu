@@ -593,9 +593,11 @@ frigate:
   restream_url: rtsp://frigate:8554
   health_timeout_seconds: 300          # production TensorRT cold boots can exceed 3 min
   api_auth:
-    token: "{DEJAVU_FRIGATE_TOKEN}"
     user: "{DEJAVU_FRIGATE_USER}"
     password: "{DEJAVU_FRIGATE_PASSWORD}"
+    headers: {}                        # alternative: static headers for a
+                                       # proxy-fronted frigate (auth.enabled false)
+  tls_verify: true                     # false, or a CA bundle path
 
 paths:
   clips_local: /clips                 # this container's view
@@ -647,6 +649,35 @@ api:
   bearer_token: "{DEJAVU_API_TOKEN}"  # empty = auth disabled
   debounce_seconds: 5
 ```
+
+Reaching Frigate's authenticated port needs more than credentials (verified
+against Frigate 0.17.2, 2026-07-31). `:8971` is HTTPS and serves a self-signed
+certificate by default (`O=FRIGATE DEFAULT CERT, CN=*`, reissued on every
+container recreate), so `tls_verify` must name a CA bundle or be `false` —
+otherwise every request fails the TLS handshake before auth is reached.
+
+`api_auth` offers two mutually independent forms, matching Frigate's two auth
+models. There is deliberately no static bearer-token field: Frigate has no
+long-lived API key — a Frigate "bearer token" is just the JWT that `/api/login`
+returns. It expires after `auth.session_length` (86400 s by default; operators
+can raise it, but there is no non-expiring value), and every one of Frigate's
+three JWT-issuing paths is bounded by it. Renewal cannot help a static token
+either: the refresh branch is gated on `jwt_source == "cookie"`, so a JWT
+presented in an `Authorization` header is never refreshed. A configured token
+would be a credential that silently stops working, so the field was removed
+rather than shipped.
+
+- `user` / `password` — for a frigate with native auth (`auth.enabled: true`,
+  the default). Logs in via `/api/login`, rides the JWT cookie, and
+  re-authenticates on a 401, so the credential self-heals.
+- `headers` — for a frigate behind an authenticating reverse proxy
+  (`auth.enabled: false` + a `proxy` block). Identity arrives as request
+  headers, so the map carries `proxy.auth_secret` (as `X-Proxy-Secret`) plus
+  whatever user/role headers `proxy.header_map` expects. Static values, so
+  nothing expires; the role mapped from the group header must resolve to
+  `admin`, since engaging saves frigate's config and restarts it. Verified
+  end-to-end against a keycloak/oauth2-proxy-fronted frigate 0.17.2
+  (2026-07-31): status, full dry-run, and admin-gated endpoints all pass.
 
 String values may reference `{DEJAVU_*}` environment variables. Referenced
 variables must exist; an explicitly empty value disables optional authentication.

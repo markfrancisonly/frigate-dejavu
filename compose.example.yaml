@@ -21,7 +21,6 @@ services:
       DEJAVU_CONFIG: /config/config.yaml
       DEJAVU_LOG_LEVEL: INFO
       DEJAVU_API_TOKEN: ""
-      DEJAVU_FRIGATE_TOKEN: ""
       DEJAVU_FRIGATE_USER: ""
       DEJAVU_FRIGATE_PASSWORD: ""
 

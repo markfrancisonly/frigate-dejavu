@@ -24,7 +24,6 @@ import recordings  # noqa: E402
 EXAMPLE_CONFIG = ROOT / "config.example.yaml"
 EXAMPLE_ENV = {
     "DEJAVU_API_TOKEN": "",
-    "DEJAVU_FRIGATE_TOKEN": "",
     "DEJAVU_FRIGATE_USER": "",
     "DEJAVU_FRIGATE_PASSWORD": "",
 }
@@ -88,7 +87,7 @@ class ConfigTests(unittest.TestCase):
 frigate:
   api_url: "http://{DEJAVU_TEST_HOST}:5000"
   api_auth:
-    token: "{DEJAVU_TEST_TOKEN}"
+    user: "{DEJAVU_TEST_USER}"
 api:
   bearer_token: literal
 """
@@ -100,7 +99,7 @@ api:
                 os.environ,
                 {
                     "DEJAVU_TEST_HOST": "frigate.local",
-                    "DEJAVU_TEST_TOKEN": "secret",
+                    "DEJAVU_TEST_USER": "someone",
                     "DEJAVU_API_TOKEN": "must-not-override",
                 },
             ):
@@ -108,12 +107,66 @@ api:
         finally:
             Path(path).unlink()
         self.assertEqual("http://frigate.local:5000", cfg["frigate"]["api_url"])
-        self.assertEqual("secret", cfg["frigate"]["api_auth"]["token"])
+        self.assertEqual("someone", cfg["frigate"]["api_auth"]["user"])
         self.assertEqual("literal", cfg["api"]["bearer_token"])
+
+    def test_tls_verify_accepts_bools_paths_and_env_strings(self):
+        cfg = load_example_config()
+        self.assertIs(True, cfg["frigate"]["tls_verify"])
+        for given, want in (
+            (False, False),
+            ("false", False),
+            ("True", True),
+            ("", True),
+            ("/etc/ssl/certs/frigate.pem", "/etc/ssl/certs/frigate.pem"),
+        ):
+            cfg["frigate"]["tls_verify"] = given
+            config.validate(cfg)
+            self.assertEqual(want, cfg["frigate"]["tls_verify"], f"given {given!r}")
+
+    def test_tls_verify_rejects_nonsense(self):
+        cfg = load_example_config()
+        for bad in (0, "relative/ca.pem", None):
+            cfg["frigate"]["tls_verify"] = bad
+            with self.assertRaisesRegex(config.ConfigError, "tls_verify"):
+                config.validate(cfg)
+
+    def test_init_http_applies_tls_verify_to_the_shared_session(self):
+        cfg = load_example_config()
+        cfg["frigate"]["tls_verify"] = False
+        cfg["frigate"]["api_auth"] = {"user": "", "password": ""}
+        original = frigate.HTTP.verify
+        try:
+            frigate.init_http(cfg)
+            self.assertIs(False, frigate.HTTP.verify)
+        finally:
+            frigate.HTTP.verify = original
+
+    def test_static_auth_headers_are_applied_to_the_session(self):
+        cfg = load_example_config()
+        cfg["frigate"]["api_auth"] = {
+            "user": "",
+            "password": "",
+            "headers": {"X-Proxy-Secret": "s3cret", "X-Auth-Request-Groups": "/ops"},
+        }
+        saved = dict(frigate.HTTP.headers)
+        try:
+            frigate.init_http(cfg)
+            self.assertEqual("s3cret", frigate.HTTP.headers["X-Proxy-Secret"])
+            self.assertEqual("/ops", frigate.HTTP.headers["X-Auth-Request-Groups"])
+        finally:
+            frigate.HTTP.headers.clear()
+            frigate.HTTP.headers.update(saved)
+
+    def test_auth_headers_reject_non_string_values(self):
+        cfg = load_example_config()
+        cfg["frigate"]["api_auth"] = {"user": "", "password": "", "headers": {"X": 1}}
+        with self.assertRaisesRegex(config.ConfigError, "headers"):
+            config.validate(cfg)
 
     def test_missing_auth_env_placeholder_is_rejected(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            with self.assertRaisesRegex(config.ConfigError, "DEJAVU_FRIGATE_TOKEN"):
+            with self.assertRaisesRegex(config.ConfigError, "DEJAVU_FRIGATE_USER"):
                 config.load_config(str(EXAMPLE_CONFIG))
 
     def test_missing_dejavu_env_placeholder_is_rejected(self):

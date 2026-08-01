@@ -15,6 +15,7 @@ import re
 import time
 
 import requests
+import urllib3
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
@@ -55,23 +56,38 @@ def clip_name(stream):
 # One shared session for every Frigate/go2rtc call, so optional credentials
 # (frigate.api_auth) ride along uniformly. Frigate's internal :5000 port is
 # unauthenticated and needs none of this; point api_url at the authenticated
-# :8971 port and supply either a bearer token or user/password (the latter
-# performs /api/login and rides the JWT cookie, re-logging in once on a 401).
+# :8971 port and supply user/password, which performs /api/login and rides the
+# JWT cookie, re-logging in on a 401. Frigate has no long-lived API key: its
+# bearer tokens are these same JWTs, they expire (24h by default), and Frigate
+# refreshes them for the cookie only — never for an Authorization header.
+# A frigate fronted by an authenticating proxy (auth.enabled false) instead
+# takes its identity from request headers; api_auth.headers carries those.
 HTTP = requests.Session()
 _AUTH = {"login_url": None, "user": "", "password": ""}
 
 
 def init_http(cfg):
-    """Apply frigate.api_auth to the shared session. Call once after config
-    load; a no-op when no credentials are configured."""
-    auth = cfg["frigate"].get("api_auth") or {}
-    token = auth.get("token", "")
-    user = auth.get("user", "")
-    if token:
-        HTTP.headers["Authorization"] = f"Bearer {token}"
-        logging.getLogger("dejavu.http").info(
-            "frigate API auth: bearer token configured"
+    """Apply frigate.tls_verify and api_auth to the shared session. Call once
+    after config load; a no-op when no credentials are configured."""
+    verify = cfg["frigate"].get("tls_verify", True)
+    HTTP.verify = verify
+    if verify is False:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        logging.getLogger("dejavu.http").warning(
+            "frigate TLS verification DISABLED (frigate.tls_verify: false)"
         )
+    elif isinstance(verify, str):
+        logging.getLogger("dejavu.http").info(
+            "frigate TLS verification via CA bundle %s", verify
+        )
+    auth = cfg["frigate"].get("api_auth") or {}
+    headers = auth.get("headers") or {}
+    if headers:
+        HTTP.headers.update(headers)
+        logging.getLogger("dejavu.http").info(
+            "frigate API auth: %d static header(s)", len(headers)
+        )
+    user = auth.get("user", "")
     if user:
         _AUTH.update(
             login_url=cfg["frigate"]["api_url"].rstrip("/") + "/api/login",

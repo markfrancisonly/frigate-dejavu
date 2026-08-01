@@ -18,6 +18,7 @@ on:
       - .dockerignore
       - Dockerfile
       - requirements.txt
+      - ruff.toml
       - config.example.yaml
       - compose.example.yaml
       - .github/workflows/build.yml
@@ -87,7 +88,6 @@ jobs:
             --publish 127.0.0.1:8898:8898 \
             --volume "$PWD/config.example.yaml:/config/config.yaml:ro" \
             --env DEJAVU_API_TOKEN= \
-            --env DEJAVU_FRIGATE_TOKEN= \
             --env DEJAVU_FRIGATE_USER= \
             --env DEJAVU_FRIGATE_PASSWORD= \
             frigate-dejavu:smoke
