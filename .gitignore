@@ -13,6 +13,7 @@
 !/compose.example.yaml
 !/config.example.yaml
 !/requirements.txt
+!/ruff.toml
 !/app/
 !/tests/
 !/homeassistant/

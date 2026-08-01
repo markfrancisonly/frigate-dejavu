@@ -126,6 +126,32 @@ send `Authorization: Bearer <token>`. `/healthz` remains public.
 Do not expose an unauthenticated API beyond the Docker host without an
 authenticating reverse proxy.
 
+### Talking to an authenticated Frigate
+
+Frigate's internal `:5000` needs no credentials and is the default. To use the
+authenticated `:8971` port instead, `frigate.api_auth` supports both of
+Frigate's auth models — either way the resolved identity needs the `admin`
+role, since engaging privacy saves Frigate's configuration and restarts it:
+
+- **Native auth** (Frigate's default): set `user` and `password`. Déjà Vu logs
+  in through `/api/login` and re-authenticates on a `401`.
+- **Proxy auth** (`auth.enabled: false` behind an authenticating reverse
+  proxy): set `headers` to the static header map the proxy contract expects —
+  typically `X-Proxy-Secret` matching Frigate's `proxy.auth_secret`, plus the
+  user/group headers named in `proxy.header_map`. Group headers must map to
+  `admin` via Frigate's `proxy.header_map.role_map`.
+
+That port is HTTPS, and Frigate serves a **self-signed certificate** there by
+default, reissued whenever the container is recreated. Point
+`frigate.tls_verify` at a CA bundle or set it `false`, or every request fails
+the TLS handshake before credentials are ever considered.
+
+There is no static-token option, because Frigate has no long-lived API key: its
+bearer tokens are `/api/login` JWTs that expire after `auth.session_length`
+(24 hours by default, raisable but never unlimited), and Frigate refreshes the
+session cookie only — never an `Authorization` header. A configured token would
+quietly stop working.
+
 ## Configuration
 
 Copy [config.example.yaml](config.example.yaml) to `config.yaml`. Most deployments

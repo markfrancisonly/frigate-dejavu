@@ -1,0 +1,4 @@
+# CI installs a floating ruff (>=0.12,<1); select rules explicitly so new
+# ruff releases can't change what passes.
+[lint]
+select = ["E4", "E7", "E9", "F"]
