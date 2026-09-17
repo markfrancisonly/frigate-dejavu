@@ -462,6 +462,7 @@ class TwoStageEngageTests(unittest.TestCase):
                 core.CancelToken(),
                 "upgrading",
             )
+            job.cfg["frigate"]["swap"] = "restart"  # exercise the restart seam
             job.soft_restart = mock.Mock()
             record = {
                 "cam": {"clip_source": "restream", "rung": "live", "mode": "loop"}
@@ -511,6 +512,7 @@ class TwoStageEngageTests(unittest.TestCase):
                 core.CancelToken(),
                 "upgrading",
             )
+            job.cfg["frigate"]["swap"] = "restart"  # exercise the restart seam
             job.soft_restart = mock.Mock()
             record = {
                 "cam": {"clip_source": "recordings", "rung": "loop", "mode": "loop"}
@@ -567,6 +569,7 @@ class TwoStageEngageTests(unittest.TestCase):
                 core.CancelToken(),
                 "upgrading",
             )
+            job.cfg["frigate"]["swap"] = "restart"  # exercise the restart seam
             job.soft_restart = mock.Mock()
             record = {
                 "cam": {"clip_source": "restream", "rung": "live", "mode": "loop"}
@@ -653,12 +656,14 @@ class LoopSourcingTests(unittest.TestCase):
         cfg = self._cfg()
         engaged = {"cam": {"ref": {"luma": 1}, "has_audio": False}}
         plan = {"cam": {}}
-        with mock.patch.object(
-            core.recordings_mod, "files_retrieval_available", return_value=False
-        ), mock.patch.object(
-            core.recordings_mod, "wait_exports_ready", return_value=True
-        ) as settle, mock.patch.object(
-            core, "_make_upgrade_task", return_value=lambda: None
+        with (
+            mock.patch.object(
+                core.recordings_mod, "files_retrieval_available", return_value=False
+            ),
+            mock.patch.object(
+                core.recordings_mod, "wait_exports_ready", return_value=True
+            ) as settle,
+            mock.patch.object(core, "_make_upgrade_task", return_value=lambda: None),
         ):
             cancel = core.CancelToken()
             gate = core._ExportReadyGate(
@@ -679,10 +684,13 @@ class LoopSourcingTests(unittest.TestCase):
     def test_no_mount_and_unsettled_exports_stays_on_freeze(self):
         cfg = self._cfg()
         engaged = {"cam": {"ref": {"luma": 1}, "has_audio": False}}
-        with mock.patch.object(
-            core.recordings_mod, "files_retrieval_available", return_value=False
-        ), mock.patch.object(
-            core.recordings_mod, "wait_exports_ready", return_value=False
+        with (
+            mock.patch.object(
+                core.recordings_mod, "files_retrieval_available", return_value=False
+            ),
+            mock.patch.object(
+                core.recordings_mod, "wait_exports_ready", return_value=False
+            ),
         ):
             cancel = core.CancelToken()
             gate = core._ExportReadyGate(
@@ -767,12 +775,8 @@ class LoopSourcingTests(unittest.TestCase):
             mock.patch.object(
                 core.recordings_mod, "files_retrieval_available", return_value=True
             ),
-            mock.patch.object(
-                core.recordings_mod, "wait_exports_ready"
-            ) as wait,
-            mock.patch.object(
-                core, "_make_upgrade_task", return_value=lambda: None
-            ),
+            mock.patch.object(core.recordings_mod, "wait_exports_ready") as wait,
+            mock.patch.object(core, "_make_upgrade_task", return_value=lambda: None),
         ):
             cancel = core.CancelToken()
             gate = core._ExportReadyGate(
@@ -815,33 +819,62 @@ class ExportLifecycleTests(unittest.TestCase):
                 recordings.start_export("http://frigate", "front", 10, 20)
 
     def test_wait_polls_only_returned_export_id(self):
-        responses = [
-            self._response(404, {"success": False}),
-            self._response(200, {"id": "front_abc123", "in_progress": True}),
-            self._response(200, {"id": "front_abc123", "in_progress": False}),
-        ]
+        exports = iter(
+            [
+                self._response(404, {"success": False}),
+                self._response(200, {"id": "front_abc123", "in_progress": True}),
+                self._response(200, {"id": "front_abc123", "in_progress": False}),
+            ]
+        )
+        job = self._response(200, {"id": "front_abc123", "status": "running"})
+
+        def get(url, **_kw):
+            return job if "/api/jobs/export/" in url else next(exports)
+
         cancel = mock.Mock()
         with (
-            mock.patch.object(recordings, "http_get", side_effect=responses) as get,
+            mock.patch.object(recordings, "http_get", side_effect=get) as get_mock,
             mock.patch.object(recordings.time, "sleep"),
         ):
             entry = recordings.wait_export("http://frigate", "front_abc123", cancel)
 
         self.assertFalse(entry["in_progress"])
+        urls = [call.args[0] for call in get_mock.call_args_list]
         self.assertEqual(
             ["http://frigate/api/exports/front_abc123"] * 3,
-            [call.args[0] for call in get.call_args_list],
+            [u for u in urls if "/jobs/" not in u],
+        )
+        self.assertEqual(
+            ["http://frigate/api/jobs/export/front_abc123"] * 3,
+            [u for u in urls if "/jobs/" in u],
         )
 
     def test_delete_uses_only_returned_export_id(self):
-        deleted = self._response(200)
-        with mock.patch.object(
-            recordings, "http_delete", return_value=deleted
-        ) as delete:
+        with (
+            mock.patch.object(
+                recordings, "http_post", return_value=self._response(200)
+            ) as post,
+            mock.patch.object(recordings, "http_delete") as legacy,
+        ):
+            recordings.delete_export("http://frigate", "front_abc123")
+
+        self.assertEqual("http://frigate/api/exports/delete", post.call_args.args[0])
+        self.assertEqual({"ids": ["front_abc123"]}, post.call_args.kwargs["json"])
+        legacy.assert_not_called()
+
+    def test_delete_falls_back_to_the_legacy_route_on_0_17(self):
+        with (
+            mock.patch.object(
+                recordings, "http_post", return_value=self._response(404)
+            ),
+            mock.patch.object(
+                recordings, "http_delete", return_value=self._response(200)
+            ) as legacy,
+        ):
             recordings.delete_export("http://frigate", "front_abc123")
 
         self.assertEqual(
-            "http://frigate/api/export/front_abc123", delete.call_args.args[0]
+            "http://frigate/api/export/front_abc123", legacy.call_args.args[0]
         )
 
 
@@ -1170,3 +1203,143 @@ class CachedFrameTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveSwapTests(unittest.TestCase):
+    def _job(self, swap="auto"):
+        job = core.Job.__new__(core.Job)
+        job.cfg = {"frigate": {"health_timeout_seconds": 5, "swap": swap}}
+        job.client = mock.Mock()
+        job.client.live_swap_available.return_value = (True, None)
+        job.client.camera_states.return_value = {"front_door": True, "garage": False}
+        job.client.go2rtc_config_read.return_value = b"streams: {}\n"
+        job.client.wait_healthy.return_value = True
+        return job
+
+    def test_placeholders_expand_from_env_like_frigate(self):
+        with mock.patch.dict(os.environ, {"FRIGATE_PW": "s3cret"}):
+            out, missing = frigate.expand_frigate_placeholders(
+                "rtsp://u:{FRIGATE_PW}@cam/1#video=copy"
+            )
+        self.assertEqual(("rtsp://u:s3cret@cam/1#video=copy", []), (out, missing))
+        out, missing = frigate.expand_frigate_placeholders(
+            "rtsp://{FRIGATE_NOPE_X}@cam"
+        )
+        self.assertEqual("rtsp://{FRIGATE_NOPE_X}@cam", out)
+        self.assertEqual(["FRIGATE_NOPE_X"], missing)
+
+    def test_version_parse(self):
+        self.assertEqual((0, 18, 0), frigate.parse_version("0.18.0-77a66e7"))
+        self.assertEqual((0, 17, 2), frigate.parse_version("0.17.2"))
+        self.assertIsNone(frigate.parse_version(None))
+
+    def test_apply_live_stops_puts_starts_and_restores_go2rtc_file(self):
+        job = self._job()
+        calls = []
+        job.client.set_camera_enabled.side_effect = lambda cam, on: calls.append(
+            ("toggle", cam, on)
+        )
+        job.client.go2rtc_put_stream.side_effect = lambda name, srcs: calls.append(
+            ("put", name, list(srcs))
+        )
+        job.client.go2rtc_config_write.side_effect = lambda data: calls.append(
+            ("cfg", data)
+        )
+        swaps = {
+            "front": {
+                "sources": ["ffmpeg:/clips/front.dejavu.mp4#video=copy"],
+                "cameras": ["front_door", "garage"],
+            }
+        }
+        with mock.patch.object(core.Job, "_wait_consumers", return_value=[]):
+            with mock.patch.object(
+                frigate, "verify_dejavu_applied", return_value=(True, [])
+            ):
+                how = job.apply(swaps, {"front": "front.dejavu.mp4"}, "on")
+        self.assertEqual(core.NOTE_LIVE, how)
+        # garage was disabled at runtime by the operator and is left alone
+        self.assertEqual(
+            [
+                ("toggle", "front_door", False),
+                ("put", "front", ["ffmpeg:/clips/front.dejavu.mp4#video=copy"]),
+                ("toggle", "front_door", True),
+                ("cfg", b"streams: {}\n"),
+            ],
+            calls,
+        )
+        job.client.restart_api.assert_not_called()
+
+    def test_live_failure_restarts_cameras_then_falls_back_to_restart(self):
+        job = self._job()
+        job.client.go2rtc_put_stream.side_effect = frigate.FrigateError("boom")
+        swaps = {"front": {"sources": ["ffmpeg:/x.mp4"], "cameras": ["front_door"]}}
+        with mock.patch.object(core.Job, "_wait_consumers", return_value=[]):
+            how = job.apply(swaps, {}, "on")
+        self.assertEqual(core.NOTE_RESTART, how)
+        job.client.set_camera_enabled.assert_any_call("front_door", True)
+        job.client.go2rtc_config_write.assert_called_once_with(b"streams: {}\n")
+        job.client.restart_api.assert_called_once_with()
+
+    def test_unresolved_placeholder_or_old_frigate_uses_restart(self):
+        job = self._job()
+        swaps = {
+            "front": {
+                "sources": ["rtsp://{FRIGATE_MISSING_X}@cam"],
+                "cameras": ["front_door"],
+            }
+        }
+        self.assertEqual(core.NOTE_RESTART, job.apply(swaps, {}, "off"))
+        job.client.set_camera_enabled.assert_not_called()
+        job.client.live_swap_available.assert_not_called()
+
+        job = self._job()
+        job.client.live_swap_available.return_value = (False, "frigate 0.17.2")
+        swaps = {"front": {"sources": ["rtsp://cam"], "cameras": ["front_door"]}}
+        self.assertEqual(core.NOTE_RESTART, job.apply(swaps, {}, "off"))
+        job.client.set_camera_enabled.assert_not_called()
+        job.client.restart_api.assert_called_once_with()
+
+    def test_swap_restart_never_touches_the_bridge(self):
+        job = self._job(swap="restart")
+        swaps = {"front": {"sources": ["rtsp://cam"], "cameras": ["front_door"]}}
+        self.assertEqual(core.NOTE_RESTART, job.apply(swaps, {}, "on"))
+        job.client.live_swap_available.assert_not_called()
+        job.client.restart_api.assert_called_once_with()
+
+    def test_swap_option_is_validated(self):
+        cfg = load_example_config()
+        self.assertEqual("auto", cfg["frigate"]["swap"])
+        cfg["frigate"]["swap"] = "sometimes"
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
+
+    def test_frigate_consumers_count_only_frigates_ffmpeg(self):
+        client = frigate.FrigateClient.__new__(frigate.FrigateClient)
+        js = {
+            "s": {
+                "consumers": [
+                    {"user_agent": "FFmpeg Frigate/0.18.0-77a66e7"},
+                    {"user_agent": "Mozilla/5.0"},
+                    {},
+                ]
+            }
+        }
+        self.assertEqual(1, client.frigate_consumers("s", js))
+        self.assertEqual(0, client.frigate_consumers("other", js))
+
+
+class ExportApiTests(unittest.TestCase):
+    def test_start_export_accepts_the_0_18_queued_202(self):
+        resp = mock.Mock(status_code=202)
+        resp.json.return_value = {"export_id": "abc", "status": "queued"}
+        with mock.patch.object(recordings, "http_post", return_value=resp):
+            self.assertEqual(
+                "abc", recordings.start_export("http://f", "cam", 1.0, 2.0)
+            )
+
+    def test_wait_export_fails_fast_on_a_failed_job(self):
+        job = mock.Mock(status_code=200)
+        job.json.return_value = {"status": "failed", "error_message": "no recordings"}
+        with mock.patch.object(recordings, "http_get", return_value=job):
+            with self.assertRaisesRegex(recordings.CaptureError, "no recordings"):
+                recordings.wait_export("http://f", "abc", None)

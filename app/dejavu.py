@@ -73,13 +73,14 @@ def build_parser():
     )
     p.add_argument(
         "--config",
-        help="appliance config path (default: $DEJAVU_CONFIG "
-        "or /config/config.yaml)",
+        help="appliance config path (default: $DEJAVU_CONFIG or /config/config.yaml)",
     )
     sub = p.add_subparsers(dest="command", required=True)
 
     on = sub.add_parser(
-        "on", help="capture streams, swap go2rtc sources, restart frigate"
+        "on",
+        help="capture streams, swap go2rtc sources, apply (live swap on "
+        "frigate 0.18+, else a frigate restart)",
     )
     on.add_argument("--profile", default=None, help="profile name (default: 'default')")
     on.add_argument(
@@ -115,7 +116,7 @@ def build_parser():
     )
 
     sub.add_parser(
-        "off", help="restore original sources " "(cancels an in-flight capture)"
+        "off", help="restore original sources (cancels an in-flight capture)"
     )
     sub.add_parser("cancel", help="alias of 'off' while a capture is running")
 
@@ -127,7 +128,7 @@ def build_parser():
 
     sub.add_parser(
         "force-restore",
-        help="write the pristine whole-file backup " "verbatim and restart frigate",
+        help="write the pristine whole-file backup verbatim and restart frigate",
     )
     return p
 

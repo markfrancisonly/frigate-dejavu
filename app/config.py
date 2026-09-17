@@ -25,6 +25,11 @@ DEFAULTS = {
         "restream_url": "rtsp://frigate:8554",
         "health_timeout_seconds": 300,
         "settle_timeout_seconds": 240,
+        # How a saved config reaches the RUNNING Frigate. auto: on Frigate >= 0.18
+        # a live swap (stop the affected cameras, PUT the streams into go2rtc,
+        # start them again — no restart), falling back to the coordinated
+        # restart when unavailable or on any failure. restart: always restart.
+        "swap": "auto",
         # Optional credentials for Frigate's AUTHENTICATED API port (8971).
         # The default internal :5000 port needs none. user/password drives
         # frigate's own login; headers suit a frigate fronted by a proxy
@@ -173,6 +178,11 @@ def validate(cfg):
         )
     _int_value(cfg, "frigate.health_timeout_seconds")
     _int_value(cfg, "frigate.settle_timeout_seconds")
+    _require(
+        f.get("swap") in ("auto", "restart"),
+        "frigate.swap",
+        "must be auto or restart",
+    )
 
     auth = cfg["frigate"].get("api_auth") or {}
     for key in ("user", "password"):
@@ -187,9 +197,7 @@ def validate(cfg):
         "password requires user",
     )
     headers = auth.get("headers") or {}
-    _require(
-        isinstance(headers, dict), "frigate.api_auth.headers", "must be a mapping"
-    )
+    _require(isinstance(headers, dict), "frigate.api_auth.headers", "must be a mapping")
     for name, value in headers.items():
         _require(
             isinstance(name, str) and name.strip() and isinstance(value, str),

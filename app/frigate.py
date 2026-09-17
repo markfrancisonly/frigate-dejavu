@@ -6,13 +6,19 @@ Vu's namespaced `go2rtc.ffmpeg.frigate_dejavu_loop` support template are touched
 (SPEC §4).
 """
 
+import base64
 import copy
 import fnmatch
 import io
 import json
 import logging
+import os
 import re
+import socket
+import ssl
+import struct
 import time
+import urllib.parse
 
 import requests
 import urllib3
@@ -63,7 +69,7 @@ def clip_name(stream):
 # A frigate fronted by an authenticating proxy (auth.enabled false) instead
 # takes its identity from request headers; api_auth.headers carries those.
 HTTP = requests.Session()
-_AUTH = {"login_url": None, "user": "", "password": ""}
+_AUTH = {"login_url": None, "user": "", "password": "", "headers": {}}
 
 
 def init_http(cfg):
@@ -82,6 +88,7 @@ def init_http(cfg):
         )
     auth = cfg["frigate"].get("api_auth") or {}
     headers = auth.get("headers") or {}
+    _AUTH["headers"] = dict(headers)
     if headers:
         HTTP.headers.update(headers)
         logging.getLogger("dejavu.http").info(
@@ -239,6 +246,137 @@ class FrigateClient:
         except FrigateError:
             return False
 
+    # -- live swap (Frigate >= 0.18; SPEC §8) --------------------------------
+
+    def ws_url(self):
+        u = urllib.parse.urlsplit(self.api)
+        return f"{'wss' if u.scheme == 'https' else 'ws'}://{u.netloc}/ws"
+
+    def camera_states(self, timeout=8):
+        """{camera: runtime enabled} from the WS bridge's onConnect burst
+        (`camera_activity[cam].config.enabled`; /api/config only knows the
+        file value)."""
+        ws = _WebSocket(self.ws_url(), timeout)
+        try:
+            ws.send_json({"topic": "onConnect"})
+            deadline = time.monotonic() + timeout
+            while True:
+                msg = ws.recv_json(max(0.0, deadline - time.monotonic()))
+                if msg is None:
+                    raise FrigateError(
+                        f"frigate websocket sent no camera_activity within {timeout}s"
+                    )
+                if msg.get("topic") != "camera_activity":
+                    continue
+                payload = msg.get("payload")
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                return {
+                    cam: bool((info.get("config") or {}).get("enabled", True))
+                    for cam, info in (payload or {}).items()
+                    if isinstance(info, dict)
+                }
+        finally:
+            ws.close()
+
+    def set_camera_enabled(self, camera, enabled, timeout=15):
+        """Flip a camera's RUNTIME state (Frigate stops/starts its ffmpeg; the
+        config file is untouched) and wait for the dispatcher's echo. Command
+        topics need the admin role: Frigate's internal :5000 port grants it to
+        every caller, on :8971 the login must be an admin."""
+        want = "ON" if enabled else "OFF"
+        ws = _WebSocket(self.ws_url(), timeout)
+        try:
+            ws.send_json({"topic": f"{camera}/enabled/set", "payload": want})
+            deadline = time.monotonic() + timeout
+            while True:
+                msg = ws.recv_json(max(0.0, deadline - time.monotonic()))
+                if msg is None:
+                    raise FrigateError(
+                        f"{camera}: no enabled/state echo within {timeout}s (command "
+                        "dropped: not admin on this port, or camera disabled in config)"
+                    )
+                if msg.get("topic") != f"{camera}/enabled/state":
+                    continue
+                if msg.get("payload") == want:
+                    return
+                raise FrigateError(
+                    f"{camera}: frigate reports enabled/state "
+                    f"{msg.get('payload')!r} after {want}"
+                )
+        finally:
+            ws.close()
+
+    def frigate_consumers(self, stream, streams_json=None):
+        """How many of a go2rtc stream's consumers are Frigate's own ffmpeg
+        (user agent 'FFmpeg Frigate/...'); viewers never count."""
+        js = self.go2rtc_streams() if streams_json is None else streams_json
+        entry = js.get(stream) or {}
+        return sum(
+            1
+            for c in entry.get("consumers") or []
+            if str(c.get("user_agent", "")).startswith(FRIGATE_CONSUMER_UA)
+        )
+
+    def go2rtc_put_stream(self, name, sources):
+        """Replace a stream's source list in the RUNNING go2rtc: drops its
+        consumers and spawns a fresh producer. (PATCH only rewrites the URL for
+        the next dial and never preempts a consumed stream, SPEC §16.)"""
+        params = [("name", name)] + [("src", s) for s in sources]
+        try:
+            r = _request("PUT", f"{self.go2rtc}/api/streams", params=params, timeout=15)
+        except requests.RequestException as exc:
+            raise FrigateError(f"go2rtc PUT /api/streams {name} failed: {exc}") from exc
+        if r.status_code != 200:
+            raise FrigateError(
+                f"go2rtc rejected stream {name} (HTTP {r.status_code}): {r.text[:200]}"
+            )
+
+    def go2rtc_config_read(self):
+        """Bytes of go2rtc's FIRST config file, the one dynamic PUTs persist
+        into (SPEC §16); None when go2rtc has no config file."""
+        try:
+            r = http_get(f"{self.go2rtc}/api/config", timeout=10)
+        except requests.RequestException as exc:
+            raise FrigateError(f"go2rtc GET /api/config failed: {exc}") from exc
+        if r.status_code in (404, 410):
+            return None
+        if r.status_code != 200:
+            raise FrigateError(f"go2rtc GET /api/config: HTTP {r.status_code}")
+        return r.content
+
+    def go2rtc_config_write(self, data):
+        try:
+            r = http_post(
+                f"{self.go2rtc}/api/config",
+                data=data,
+                headers={"Content-Type": "application/yaml"},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise FrigateError(f"go2rtc POST /api/config failed: {exc}") from exc
+        if r.status_code != 200:
+            raise FrigateError(
+                f"go2rtc POST /api/config: HTTP {r.status_code}: {r.text[:200]}"
+            )
+
+    def live_swap_available(self):
+        """(ok, reason): Frigate >= 0.18 and its WS bridge answers this client."""
+        version = self.version()
+        parsed = parse_version(version)
+        if parsed is None:
+            return False, f"frigate version unreadable ({version!r})"
+        if parsed < FRIGATE_LIVE_SWAP_MIN_VERSION:
+            return (
+                False,
+                f"frigate {version} has no runtime camera toggle (needs 0.18+)",
+            )
+        try:
+            self.camera_states()
+        except (FrigateError, ValueError) as exc:
+            return False, f"frigate websocket: {exc}"
+        return True, None
+
     # -- restart/health orchestration ---------------------------------------
 
     def wait_down(self, timeout=30):
@@ -263,6 +401,164 @@ class FrigateClient:
                 consecutive = 0
             time.sleep(2)
         return False
+
+
+# --------------------------------------------------------------------------
+# Live swap primitives (Frigate >= 0.18, SPEC §8): the camera runtime toggle
+# over Frigate's WebSocket bridge, and go2rtc's dynamic stream API.
+# --------------------------------------------------------------------------
+
+# Frigate's go2rtc config generator str.format()s every stream source with the
+# FRIGATE_* environment; a live restore has to expand the originals the same way.
+FRIGATE_PLACEHOLDER_RE = re.compile(r"\{(FRIGATE_[A-Za-z0-9_]+)\}")
+FRIGATE_CONSUMER_UA = "FFmpeg Frigate/"
+FRIGATE_LIVE_SWAP_MIN_VERSION = (0, 18)
+
+
+def expand_frigate_placeholders(source, env=None):
+    """`{FRIGATE_X}` -> env FRIGATE_X. Returns (expanded, [unresolved names])."""
+    env = os.environ if env is None else env
+    missing = []
+
+    def sub(m):
+        name = m.group(1)
+        if name in env:
+            return env[name]
+        missing.append(name)
+        return m.group(0)
+
+    return FRIGATE_PLACEHOLDER_RE.sub(sub, str(source)), missing
+
+
+def parse_version(text):
+    """'0.18.0-77a66e7' -> (0, 18, 0); None when unparseable."""
+    m = re.match(r"\s*v?(\d+)\.(\d+)(?:\.(\d+))?", text or "")
+    if not m:
+        return None
+    return tuple(int(g or 0) for g in m.groups())
+
+
+class _WebSocket:
+    """Minimal RFC 6455 text-frame client (stdlib only) for Frigate's /ws
+    bridge. Carries the shared session's auth cookie and static headers."""
+
+    def __init__(self, url, timeout):
+        u = urllib.parse.urlsplit(url)
+        if u.scheme not in ("ws", "wss") or not u.hostname:
+            raise FrigateError(f"bad websocket url: {url}")
+        port = u.port or (443 if u.scheme == "wss" else 80)
+        self.sock = None
+        self._buf = b""
+        try:
+            self.sock = socket.create_connection((u.hostname, port), timeout=timeout)
+            if u.scheme == "wss":
+                ctx = ssl.create_default_context()
+                if HTTP.verify is False:
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                elif isinstance(HTTP.verify, str):
+                    ctx.load_verify_locations(HTTP.verify)
+                self.sock = ctx.wrap_socket(self.sock, server_hostname=u.hostname)
+            key = base64.b64encode(os.urandom(16)).decode()
+            lines = [
+                f"GET {u.path or '/'} HTTP/1.1",
+                f"Host: {u.netloc}",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Key: {key}",
+                "Sec-WebSocket-Version: 13",
+            ]
+            cookie = "; ".join(f"{c.name}={c.value}" for c in HTTP.cookies)
+            if cookie:
+                lines.append(f"Cookie: {cookie}")
+            lines += [f"{k}: {v}" for k, v in _AUTH["headers"].items()]
+            self.sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = self.sock.recv(4096)
+                if not chunk or len(head) > 65536:
+                    raise FrigateError("websocket upgrade: no response")
+                head += chunk
+            status = head.split(b"\r\n", 1)[0].decode(errors="replace")
+            if " 101 " not in status:
+                raise FrigateError(f"websocket upgrade refused: {status}")
+            self._buf = head.split(b"\r\n\r\n", 1)[1]
+        except (OSError, ssl.SSLError) as exc:
+            self.close()
+            raise FrigateError(f"websocket connect failed ({url}): {exc}") from exc
+        except FrigateError:
+            self.close()
+            raise
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def _read_exact(self, n):
+        while len(self._buf) < n:
+            chunk = self.sock.recv(max(4096, n - len(self._buf)))
+            if not chunk:
+                raise FrigateError("websocket closed by frigate")
+            self._buf += chunk
+        data, self._buf = self._buf[:n], self._buf[n:]
+        return data
+
+    def _send_frame(self, opcode, data):
+        head = bytearray([0x80 | opcode])
+        n = len(data)
+        if n < 126:
+            head.append(0x80 | n)
+        elif n < 65536:
+            head.append(0x80 | 126)
+            head += struct.pack(">H", n)
+        else:
+            head.append(0x80 | 127)
+            head += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        self.sock.sendall(bytes(head) + mask + masked)
+
+    def send_json(self, obj):
+        self._send_frame(0x1, json.dumps(obj).encode())
+
+    def recv_json(self, timeout):
+        """Next JSON text frame, or None once `timeout` elapses. Answers pings;
+        raises FrigateError when frigate closes the socket."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            self.sock.settimeout(remaining)
+            try:
+                b1, b2 = self._read_exact(2)
+                opcode, n = b1 & 0x0F, b2 & 0x7F
+                if n == 126:
+                    n = struct.unpack(">H", self._read_exact(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", self._read_exact(8))[0]
+                if b2 & 0x80:
+                    self._read_exact(4)  # servers must not mask; tolerate
+                payload = self._read_exact(n)
+            except socket.timeout:
+                return None
+            except OSError as exc:
+                raise FrigateError(f"websocket read failed: {exc}") from exc
+            if opcode == 0x8:
+                raise FrigateError("websocket closed by frigate")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode != 0x1:
+                continue
+            try:
+                return json.loads(payload)
+            except ValueError:
+                continue
 
 
 # --------------------------------------------------------------------------
