@@ -22,9 +22,9 @@
 
 ## Frigate Incognito mode
 
-Frigate dejavu allows you to swap live go2rtc camera feeds with convincing quality video loops or frozen frames by rewriting the go2rtc streams in Frigate’s configuration through its REST API on demand. After an automatic restart, recordings, detection, birdseye, Home Assistant cards, and WebRTC viewers all keep working. Turning privacy off restores the original stream sources and restarts Frigate again.
+Frigate dejavu allows you to swap live go2rtc camera feeds with convincing quality video loops or frozen frames by rewriting the go2rtc streams in Frigate’s configuration through its REST API on demand. On Frigate 0.18+ the change is applied live — the affected cameras are stopped, the streams are swapped in go2rtc, and the cameras are started again, a gap of a few seconds with no Frigate restart; older Frigates get one coordinated restart instead. Recordings, detection, birdseye, Home Assistant cards, and WebRTC viewers all keep working. Turning privacy off restores the original stream sources the same way.
 
-Dejavu privacy engages in two stages. Stage 1 prepares a freeze frame for every profiled stream, rewrites the go2rtc sources to point at those clips, and goes on through one coordinated Frigate restart—privacy is immediate, guaranteed, and permanent, and a stream is never left live. Stage 2 (loop mode only) then runs in the background while already private: it searches each camera's recent recordings for quiet or sparsely active scenes using Frigate activity, lighting, IR mode, drift, and loop-seam similarity, copies the winner while silencing audio (by default), atomically swaps each loop over its freeze clip at the same path, and swaps them in through a second coordinated Frigate restart. A stream whose loop is not ready in time stays on its freeze frame permanently.
+Dejavu privacy engages in two stages. Stage 1 prepares a freeze frame for every profiled stream, rewrites the go2rtc sources to point at those clips, and goes on through one apply (a live swap, or one coordinated Frigate restart)—privacy is immediate, guaranteed, and permanent, and a stream is never left live. Stage 2 (loop mode only) then runs in the background while already private: it searches each camera's recent recordings for quiet or sparsely active scenes using Frigate activity, lighting, IR mode, drift, and loop-seam similarity, copies the winner while silencing audio (by default), atomically swaps each loop over its freeze clip at the same path, and swaps them in (live: one go2rtc re-PUT per stream; otherwise a second coordinated Frigate restart). A stream whose loop is not ready in time stays on its freeze frame permanently.
 
 If you want more raw video, set `mode: loop` with the opt-in `restream` source to capture live video directly, bypassing all recordings-based safety and ranking guards.
 
@@ -74,7 +74,8 @@ a toy configuration:
 cameras -------> go2rtc ┬-> Frigate -> recordings / detection / Birdseye
 replacement clips -^   └-> WebRTC / Home Assistant
 
-Déjà Vu -> Frigate REST API: validate config, save sources, restart, verify
+Déjà Vu -> Frigate REST API: validate config, save sources, apply (live swap
+                             or restart), verify
 ```
 
 - Every Frigate camera consumes a local `go2rtc` restream.
@@ -82,7 +83,11 @@ Déjà Vu -> Frigate REST API: validate config, save sources, restart, verify
 - Frigate's recordings mount is read-only; its export API covers missing or
   unreadable segments.
 - Déjà Vu reaches Frigate and embedded `go2rtc` through the configured endpoints.
-- Restarts go through Frigate's API. No Docker socket is mounted.
+- The live swap uses Frigate's WebSocket bridge (admin on the internal port)
+  and go2rtc's stream API; restarts go through Frigate's API. No Docker socket
+  is mounted. Give the container Frigate's `FRIGATE_*` environment (compose
+  `env_file`) so a live restore can expand the original sources; without it,
+  switch-off falls back to a restart.
 
 Different addresses, mounts, and camera brands are expected. Changing the
 topology or restart model requires revalidation; see SPEC §2 for the verified
@@ -139,7 +144,8 @@ authenticating reverse proxy.
 Frigate's internal `:5000` needs no credentials and is the default. To use the
 authenticated `:8971` port instead, `frigate.api_auth` supports both of
 Frigate's auth models — either way the resolved identity needs the `admin`
-role, since engaging privacy saves Frigate's configuration and restarts it:
+role, since engaging privacy saves Frigate's configuration and stops/starts
+cameras or restarts it:
 
 - **Native auth** (Frigate's default): set `user` and `password`. Déjà Vu logs
   in through `/api/login` and re-authenticates on a `401`.
@@ -169,7 +175,7 @@ only need to change the Frigate endpoints, volume paths, and profile camera name
 
 | Mode | Source | What it does | Fallback |
 |---|---|---|---|
-| `loop` | `recordings` | Freeze on via a restart, then a background loop upgrade lands via a second restart | Stay on freeze |
+| `loop` | `recordings` | Freeze on (live swap or restart), then a background loop upgrade lands the same way | Stay on freeze |
 | `loop` | `restream` | Captures a live loop directly; bypasses recordings-based guards | Abort activation |
 | `freeze` | `recordings` | Builds one freeze clip | Live → recorded → cached → black |
 | `freeze` | `restream` | Builds one freeze clip without searching recordings | Live → cached → black |
@@ -243,7 +249,8 @@ off -> capturing -> applying -> on -> restoring -> off
 - Stage-1 freeze capture finishes before any configuration change (the loop
   upgrade runs later, in stage 2).
 - Frigate validates the proposed configuration before saving it.
-- After restart, Déjà Vu verifies through `go2rtc` that every replacement landed.
+- After applying, Déjà Vu verifies through `go2rtc` that every replacement
+  landed (and, live, that Frigate is consuming again).
 - A failed activation rolls back automatically while Frigate remains reachable.
 - Turning off during capture cancels workers, removes partial clips, and leaves
   Frigate untouched.
@@ -278,12 +285,15 @@ Profiles are mutually exclusive, so select `Off` before changing active profiles
   would require transcoding.
 - Lighting is matched when privacy engages. Re-toggle after a major dawn/dusk
   transition during a long session.
-- Engaging in `loop` mode restarts Frigate twice a short time apart: restart #1
-  turns privacy on with freeze frames, then the background loop upgrade lands
-  via restart #2 (up to `capture.loop_assembly_budget_seconds` later — a
-  second, delayed, brief recording/detection gap after the appliance already
-  reported `on`). `freeze` mode and switch-off each restart Frigate once. Every
-  restart lets `go2rtc` and Frigate consumers rebuild in the correct order.
+- Engaging in `loop` mode applies twice a short time apart: stage 1 turns
+  privacy on with freeze frames, then the background loop upgrade lands (up to
+  `capture.loop_assembly_budget_seconds` later — a second, delayed, brief gap on
+  the affected cameras after the appliance already reported `on`). Live swaps
+  (Frigate 0.18+, `frigate.swap: auto`) cost a few seconds per camera and never
+  restart Frigate; the restart fallback (or `frigate.swap: restart`) restarts
+  Frigate once per apply and lets `go2rtc` and Frigate consumers rebuild in the
+  correct order. `dejavu status` shows which ran (`swap=live` /
+  `restart=frigate-api`).
 - Offline cameras freeze on their ladder rung (live frame → recorded frame →
   cached frame → black, visible in status and logs) and can still upgrade to a
   loop of their own recent recordings when any exist in the search window —

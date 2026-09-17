@@ -18,6 +18,12 @@ frigate:
   settle_timeout_seconds: 240             # before sourcing from recordings, wait for
                                           # frigate's export API to answer — it lags
                                           # /api/version by minutes after a restart
+  swap: auto                              # auto: on Frigate 0.18+ apply changes live —
+                                          #   stop the affected cameras, PUT the streams
+                                          #   into go2rtc, start them again; no restart,
+                                          #   ~4 s gap per camera. Falls back to the
+                                          #   coordinated restart when unavailable or on
+                                          #   any failure. restart: always restart.
   api_auth:                               # optional — only when api_url targets Frigate's
     user: "{DEJAVU_FRIGATE_USER}"         #   authenticated port (8971); logs in via
     password: "{DEJAVU_FRIGATE_PASSWORD}" #   /api/login and re-logs in on a 401

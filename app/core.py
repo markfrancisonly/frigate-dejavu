@@ -54,6 +54,15 @@ class JobError(Exception):
 BACKUP_KEEP = 10
 
 
+# How the saved config reached the running Frigate (status `note` prefix).
+NOTE_LIVE = "swap=live"
+NOTE_RESTART = "restart=frigate-api"
+
+
+def _how_text(how):
+    return "live swap" if how == NOTE_LIVE else "coordinated restart"
+
+
 def prune_state_snapshots(state_dir, keep=BACKUP_KEEP):
     """Enforce BACKUP_KEEP over the timestamped state snapshots.
 
@@ -570,6 +579,205 @@ class Job:
 
     # -- surgical restore (SPEC §7.2) -----------------------------------------
 
+    # -- live swap (SPEC §8; Frigate >= 0.18) --------------------------------
+
+    def _live_plan(self, swaps):
+        """Expand `{FRIGATE_*}` the way Frigate's go2rtc generator does and
+        refuse what go2rtc's dynamic API cannot take. Returns (plan, reason)."""
+        plan = {}
+        for stream, spec in swaps.items():
+            sources = []
+            for src in spec["sources"]:
+                expanded, missing = frigate_mod.expand_frigate_placeholders(src)
+                if missing:
+                    return None, (
+                        f"{stream}: unresolved {', '.join(sorted(set(missing)))} — "
+                        "give dejavu Frigate's FRIGATE_* environment (compose env_file)"
+                    )
+                if " " in expanded:
+                    return (
+                        None,
+                        f"{stream}: go2rtc's dynamic API rejects sources with spaces",
+                    )
+                sources.append(expanded)
+            if not sources:
+                return None, f"{stream}: no sources to apply"
+            plan[stream] = {
+                "sources": sources,
+                "cameras": list(spec.get("cameras") or []),
+            }
+        return plan, None
+
+    def apply(self, swaps, expect_clips, direction):
+        """Bring the RUNNING Frigate in line with the config that was just saved:
+        a live swap when available (frigate.swap: auto), else — and after any
+        live failure — the coordinated restart. `swaps` is
+        {stream: {"sources": [...], "cameras": [...]}}. Returns the status note
+        fragment (NOTE_LIVE / NOTE_RESTART)."""
+        if self.cfg["frigate"]["swap"] != "restart":
+            plan, why = self._live_plan(swaps)
+            if plan is not None:
+                ok, why = self.client.live_swap_available()
+                if ok:
+                    try:
+                        self.apply_live(plan, expect_clips, direction)
+                        return NOTE_LIVE
+                    except (JobError, FrigateError) as exc:
+                        log.warning(
+                            "live swap failed (%s) — falling back to a coordinated restart",
+                            exc,
+                        )
+                        why = None
+            if why:
+                log.info(
+                    "live swap unavailable (%s) — using a coordinated restart", why
+                )
+        self.restart_and_verify(expect_clips, direction)
+        return NOTE_RESTART
+
+    def apply_loops(self, record, promoted):
+        """Stage-2 seam. Live: PUT each promoted stream's (unchanged) dejavu
+        source again — go2rtc always spawns a fresh producer, so the loop that
+        was swapped over the freeze clip at the same path is loaded
+        deterministically. Falls back to soft_restart. Returns (live, how)."""
+        expect = {s: frigate_mod.clip_name(s) for s in promoted}
+        if self.cfg["frigate"]["swap"] != "restart":
+            swaps = {
+                s: {
+                    "sources": [record[s]["dejavu_source"]],
+                    "cameras": record[s]["cameras"],
+                }
+                for s in promoted
+            }
+            plan, why = self._live_plan(swaps)
+            if plan is not None:
+                ok, why = self.client.live_swap_available()
+                if ok:
+                    try:
+                        self.apply_live(plan, expect, "on")
+                        return True, NOTE_LIVE
+                    except (JobError, FrigateError) as exc:
+                        log.warning(
+                            "live loop swap failed (%s) — falling back to a restart",
+                            exc,
+                        )
+                        why = None
+            if why:
+                log.info("live swap unavailable (%s) — loop upgrade via restart", why)
+        return self.soft_restart(expect), NOTE_RESTART
+
+    def _wait_consumers(self, plan, want_zero, timeout):
+        """Poll go2rtc until each stream's Frigate consumer count is zero (after
+        stopping its cameras) or non-zero (after starting them). Returns the
+        streams that did not get there in time. /api/stats is useless here: its
+        camera pids/fps are never zeroed on disable."""
+        pending = set(plan)
+        deadline = time.monotonic() + timeout
+        while pending and time.monotonic() < deadline:
+            try:
+                js = self.client.go2rtc_streams()
+            except FrigateError:
+                time.sleep(1)
+                continue
+            for s in list(pending):
+                if (self.client.frigate_consumers(s, js) == 0) == want_zero:
+                    pending.discard(s)
+            if pending:
+                time.sleep(0.5)
+        return sorted(pending)
+
+    def apply_live(self, plan, expect_clips, direction):
+        """Stop every affected camera, PUT every stream into the running go2rtc,
+        start the cameras again, verify. Frigate is never restarted; cameras
+        outside the plan are untouched; cameras the operator disabled at runtime
+        stay disabled. go2rtc persists dynamic PUTs into its first config file
+        (SPEC §16), so that file is snapshotted and written back byte-exact.
+        Any failure starts what was stopped, then raises so the caller can fall
+        back to a restart (the config is already saved for it)."""
+        client = self.client
+        states = client.camera_states()
+        cameras = list(
+            dict.fromkeys(c for spec in plan.values() for c in spec["cameras"])
+        )
+        targets = [c for c in cameras if states.get(c, False)]
+        unknown = [c for c in cameras if c not in states]
+        if unknown:
+            log.warning(
+                "live swap: cameras unknown to frigate's runtime, not toggled: %s",
+                ", ".join(unknown),
+            )
+        idle = [c for c in cameras if c in states and not states[c]]
+        if idle:
+            log.info(
+                "live swap: cameras already disabled at runtime stay so: %s",
+                ", ".join(idle),
+            )
+
+        snapshot = client.go2rtc_config_read()
+        log.info(
+            "live swap: stopping %d camera(s), replacing %d stream(s)...",
+            len(targets),
+            len(plan),
+        )
+        started = time.monotonic()
+        stopped, failed_start = [], []
+        try:
+            for cam in targets:
+                client.set_camera_enabled(cam, False)
+                stopped.append(cam)
+            lingering = self._wait_consumers(plan, want_zero=True, timeout=10)
+            if lingering:
+                log.warning(
+                    "live swap: frigate still consuming %s after stop — replacing anyway",
+                    ", ".join(lingering),
+                )
+            for stream, spec in plan.items():
+                client.go2rtc_put_stream(stream, spec["sources"])
+        finally:
+            for cam in stopped:
+                try:
+                    client.set_camera_enabled(cam, True)
+                except FrigateError as exc:
+                    failed_start.append(f"{cam}: {exc}")
+            if snapshot is not None:
+                try:
+                    client.go2rtc_config_write(snapshot)
+                except FrigateError as exc:
+                    log.warning("go2rtc config file not restored after PUT: %s", exc)
+        if failed_start:
+            raise JobError(
+                "cameras did not come back after the live swap: "
+                + "; ".join(failed_start)
+            )
+
+        consuming = {
+            s: spec
+            for s, spec in plan.items()
+            if any(c in stopped for c in spec["cameras"])
+        }
+        missing = self._wait_consumers(consuming, want_zero=False, timeout=30)
+        if missing:
+            raise JobError("frigate did not reconnect to: " + ", ".join(missing))
+        verify = (
+            frigate_mod.verify_dejavu_applied
+            if direction == "on"
+            else frigate_mod.verify_dejavu_removed
+        )
+        ok, bad = verify(client, expect_clips)
+        if not ok:
+            raise JobError(
+                f"go2rtc did not {'apply' if direction == 'on' else 'remove'} dejavu "
+                f"sources for: {', '.join(bad)}"
+            )
+        log.info(
+            "live swap done in %.1fs: %d stream(s) %s, %d camera(s) restarted, "
+            "frigate not restarted",
+            time.monotonic() - started,
+            len(plan),
+            "serving dejavu clips" if direction == "on" else "restored to live",
+            len(stopped),
+        )
+
     def surgical_restore(self):
         """Swap recorded streams back to their originals inside the CURRENT
         config (other user edits preserved). Returns summary dict."""
@@ -733,7 +941,7 @@ def _engage_freeze(cfg, req, job, store, stream, meta):
         )
         result, ref = _freeze_and_cache(cfg, job, stream, png, src_meta, reference=True)
         log.debug(
-            "%s: rung 1 (live) OK in %.1fs — %sx%s %s, luma=%.0f " "chroma=%.1f",
+            "%s: rung 1 (live) OK in %.1fs — %sx%s %s, luma=%.0f chroma=%.1f",
             stream,
             time.monotonic() - t0,
             src_meta.get("width"),
@@ -746,7 +954,7 @@ def _engage_freeze(cfg, req, job, store, stream, meta):
     except capture_mod.CaptureError as exc:
         reasons.append(f"live: {exc}")
         log.warning(
-            "%s: no live frame (%s) — camera offline? descending the " "freeze ladder",
+            "%s: no live frame (%s) — camera offline? descending the freeze ladder",
             stream,
             exc,
         )
@@ -1096,9 +1304,7 @@ def _collect_upgrades(
     timer = None
     if deadline_seconds and deadline_seconds > 0:
         started = (
-            budget_started_at
-            if budget_started_at is not None
-            else time.monotonic()
+            budget_started_at if budget_started_at is not None else time.monotonic()
         )
         deadline = started + deadline_seconds
         hard = deadline + _COLLECT_GRACE_SECONDS
@@ -1243,7 +1449,9 @@ def _plan_synced_windows(cfg, req, plan):
     return anchor
 
 
-def _run_loop_upgrade(cfg, job, req, plan, engaged, record, replacements, session):
+def _run_loop_upgrade(
+    cfg, job, req, plan, engaged, record, replacements, session, how=NOTE_RESTART
+):
     """Stage 2 (best-effort): assemble loops in the background and swap them in
     via one bare restart. Privacy is ALREADY guaranteed on freeze, so this only
     ever upgrades a private freeze to a private loop and NEVER raises — every
@@ -1325,16 +1533,16 @@ def _run_loop_upgrade(cfg, job, req, plan, engaged, record, replacements, sessio
                 job_pid=mypid,
                 upgrade_pid=None,
                 streams=streams,
-                note="restart=frigate-api; loop upgrade",
+                note=f"{how}; loop upgrade",
             )
             job.phase = "restarting"
 
-        log.info("stage 2: swapping in %d loop(s) via one restart", len(promoted))
+        log.info("stage 2: swapping in %d loop(s)", len(promoted))
         try:
-            live = job.soft_restart({s: frigate_mod.clip_name(s) for s in promoted})
+            live, how = job.apply_loops(record, promoted)
         except (JobError, FrigateError) as exc:
             log.error(
-                "stage 2: loop-upgrade restart did not come healthy (%s) — the "
+                "stage 2: loop upgrade did not apply (%s) — the "
                 "dejavu config is intact and private, but Frigate needs attention",
                 exc,
             )
@@ -1345,9 +1553,9 @@ def _run_loop_upgrade(cfg, job, req, plan, engaged, record, replacements, sessio
         # still serving freeze (both private). Record it honestly rather than
         # claiming loops are on air.
         note = (
-            "restart=frigate-api; loops"
+            f"{how}; loops"
             if live
-            else "restart=frigate-api; loops staged (restart no-op — load next restart)"
+            else f"{how}; loops staged (restart no-op — load next restart)"
         )
         with store.locked():
             store.mark_completed(state="on", last_error=None, note=note)
@@ -1375,7 +1583,7 @@ def _run_loop_upgrade(cfg, job, req, plan, engaged, record, replacements, sessio
             if st.get("state") == "on" and st.get("upgrade_pid") == mypid:
                 # bailed before promoting loops (no futures / no loop / error):
                 # clear the marker AND replace the stale 'upgrading' note.
-                store.update(upgrade_pid=None, note="restart=frigate-api; on freeze")
+                store.update(upgrade_pid=None, note=f"{how}; on freeze")
 
 
 def cmd_on(
@@ -1576,7 +1784,11 @@ def cmd_on(
         config_touched = True
 
         expect = {s: frigate_mod.clip_name(s) for s in replacements}
-        job.restart_and_verify(expect, direction="on")
+        swaps = {
+            s: {"sources": [replacements[s]], "cameras": record[s]["cameras"]}
+            for s in replacements
+        }
+        how = job.apply(swaps, expect, direction="on")
 
         # Enter the cancellable 'upgrading' phase BEFORE publishing state='on' +
         # upgrade_pid below, so an 'off' that arrives the instant state becomes
@@ -1603,14 +1815,11 @@ def cmd_on(
                 last_error=None,
                 last_completed_at=now_iso(),
                 last_completed_ts=time.time(),
-                note=(
-                    "restart=frigate-api; upgrading"
-                    if want_loops
-                    else "restart=frigate-api"
-                ),
+                note=(f"{how}; upgrading" if want_loops else how),
             )
         log.info(
-            "dejavu is ON via freeze after coordinated restart (%d stream(s))%s",
+            "dejavu is ON via freeze after %s (%d stream(s))%s",
+            _how_text(how),
             len(replacements),
             "; assembling loops in the background" if want_loops else "",
         )
@@ -1634,7 +1843,9 @@ def cmd_on(
         # NEVER raises — any failure leaves the permanent freeze baseline intact.
         # (job.phase is already 'upgrading', set before the interim ON write.)
         if want_loops:
-            _run_loop_upgrade(cfg, job, req, plan, ok, record, replacements, session)
+            _run_loop_upgrade(
+                cfg, job, req, plan, ok, record, replacements, session, how
+            )
         return 0
 
     except Cancelled:
@@ -1747,13 +1958,21 @@ def cmd_off(cfg):
     job.phase = "restoring"
     job.install_signal_handlers()
     try:
-        record = store.read_streams_record() or {}
-        expect = {s: frigate_mod.clip_name(s) for s in (record.get("streams") or {})}
+        streams_rec = (store.read_streams_record() or {}).get("streams") or {}
+        expect = {s: frigate_mod.clip_name(s) for s in streams_rec}
         result = job.surgical_restore()  # config/persistence layer (template stays)
 
-        restarted = bool(expect or result["changed"])
-        if restarted:
-            job.restart_and_verify(expect, direction="off")
+        how = None
+        if expect or result["changed"]:
+            swaps = {
+                s: {
+                    "sources": rec["original_sources"],
+                    "cameras": rec.get("cameras") or [],
+                }
+                for s, rec in streams_rec.items()
+                if s not in result["missing"] and rec.get("original_sources")
+            }
+            how = job.apply(swaps, expect, direction="off")
         else:
             log.info("config already clean — nothing to restore")
 
@@ -1762,7 +1981,7 @@ def cmd_off(cfg):
             log.info("removed %d clip file(s)", removed)
         store.clear_streams_record()
 
-        notes = ["restart=frigate-api"] if restarted else []
+        notes = [how] if how else []
         if result["drifted"]:
             notes.append(
                 "drift detected during restore: " + ", ".join(result["drifted"])
@@ -1780,7 +1999,7 @@ def cmd_off(cfg):
             )
         log.info(
             "dejavu is OFF via %s (restored %d stream(s)%s)",
-            "api restart" if restarted else "config",
+            _how_text(how) if how else "config",
             len(result["restored"]),
             "; DRIFT: " + ", ".join(result["drifted"]) if result["drifted"] else "",
         )

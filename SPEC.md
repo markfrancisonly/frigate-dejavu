@@ -423,8 +423,10 @@ capture refuses the whole activation before Frigate's config is touched.
 7. `POST /api/config/save?save_option=saveonly` (body = edited raw YAML).
    Frigate validates server-side; on rejection → nothing was saved → state
    `off`, error surfaced, clips kept for inspection.
-8. Apply through one coordinated Frigate restart — **restart #1** (§8) — wait
-   healthy, and **verify**: go2rtc `/api/streams` shows each replaced stream's
+8. Apply (§8): a **live swap** on Frigate 0.18+ (stop the affected cameras,
+   `PUT` each replaced stream into the running go2rtc, start the cameras
+   again), else — or if the live swap fails — one coordinated Frigate restart,
+   **restart #1**. Then **verify**: Frigate is consuming again and go2rtc `/api/streams` shows each replaced stream's
    source is the privacy clip. All verified → state `on`; **privacy is now
    immediate, guaranteed, and permanent**. Any stream still live → automatic
    rollback (restore sources, restart again), state `error` with detail.
@@ -444,12 +446,13 @@ job — every error leaves the permanent freeze baseline standing.
     not ready in time, or that finds no window, stays on its freeze frame
     permanently.
 11. Atomically `os.replace` each finished loop over its freeze clip at the SAME
-    path, then apply through a SECOND coordinated Frigate restart — **restart #2**
-    (§8). It is a bare restart: the config clip path is byte-identical for freeze
-    and loop, so NO config change is needed. Verification is a no-op-safe check
-    that Frigate was OBSERVED restarting (which forces go2rtc to re-open the
-    swapped inode); if the restart was a no-op the loops are staged and load on
-    the next restart. Privacy is intact throughout. A concurrent `off` claims the
+    path, then apply (§8): live, a `PUT` of the UNCHANGED dejavu source per
+    promoted stream — go2rtc always spawns a fresh producer, so the swapped
+    inode is loaded deterministically; otherwise a SECOND coordinated restart —
+    **restart #2** — a bare restart, since the config clip path is byte-identical
+    for freeze and loop. On the restart path verification is a no-op-safe check
+    that Frigate was OBSERVED restarting; if it was a no-op the loops are staged
+    and load on the next restart. Privacy is intact throughout. A concurrent `off` claims the
     restore transition first, so the upgrade's ownership gate makes it
     promote/restart nothing — `off` wins.
 
@@ -464,25 +467,55 @@ job — every error leaves the permanent freeze baseline standing.
    with the original and the drifted version is saved to `state/drift.<ts>.
    yaml` (warned in status + logs). Whole-file backup remains as disaster
    fallback (`dejavu force-restore` writes `backup.current.yaml` verbatim).
-3. Save (`saveonly`) → coordinated Frigate restart → wait for the Frigate API
-   and go2rtc → verify the privacy sources were removed → state `off`.
+3. Save (`saveonly`) → apply (§8: live swap with the original sources,
+   `{FRIGATE_*}` expanded from dejavu's own environment exactly as Frigate's
+   go2rtc generator does, else a coordinated restart) → verify the privacy
+   sources were removed → state `off`.
 4. Clips deleted unless `capture.keep_clips_after_off: true`. State artifacts
    (backups, drift copies) are retained.
 
-## 8. Restart & verification strategy
+## 8. Apply & verification strategy
 
-- Engage and restore always use a coordinated full Frigate restart. This
-  rebuilds go2rtc and Frigate's camera consumers in order and avoids reporting
-  success while camera processes remain stranded after producer replacement.
-- Verify go2rtc `/api/streams` references every expected privacy clip (or no
-  longer references one during restore).
+Every transition first SAVES the edited config (`save_option=saveonly`) so a
+later restart reproduces it, then brings the RUNNING Frigate in line by one of
+two paths (`frigate.swap`):
+
+- **Live swap** (`auto`, Frigate ≥ 0.18; verified 2026-09-17, §16): for the
+  affected cameras only — (1) `<cam>/enabled/set OFF` over Frigate's WebSocket
+  bridge (the dispatcher stops that camera's ffmpeg, recording closes its
+  segment, the config file is untouched), (2) `PUT /api/streams?name&src…`
+  into go2rtc for each replaced stream (drops consumers, spawns a fresh
+  producer; `PATCH` only rewrites the URL for the next dial and never
+  preempts), (3) `enabled/set ON` (Frigate re-dials go2rtc and gets the new
+  producer). Frigate never restarts, cameras outside the plan are untouched,
+  and the per-camera recording gap is the replace + start time (about 4 s
+  measured). Cameras the operator had disabled at runtime stay disabled. The
+  bridge grants the admin role to every caller on the internal :5000 port; on
+  :8971 the login must be an admin. go2rtc persists dynamic PUTs into its first
+  config file, so that file is read via `GET /api/config` before and written
+  back byte-exact after.
+- **Coordinated restart** (`restart`, or `auto` when the live path is
+  unavailable or fails at any step): `POST /api/restart`, wait healthy. This
+  rebuilds go2rtc and Frigate's camera consumers in order. It is the fallback
+  for Frigate < 0.18, a bridge that does not answer, an original source with a
+  `{FRIGATE_*}` placeholder dejavu cannot expand (give it Frigate's
+  environment), a source containing spaces (go2rtc's dynamic API rejects
+  them), or a live swap whose verification fails — the cameras are started
+  again before falling back.
+
+Verification is the same for both: go2rtc `/api/streams` references every
+expected privacy clip (or no longer does, on restore); the live path also
+requires Frigate's own consumer (user agent `FFmpeg Frigate/…`) back on every
+stream whose cameras were toggled. `/api/stats` is NOT a signal: its camera
+pids/fps are never zeroed on disable.
+
 - Restarts use Frigate's `POST /api/restart`. The appliance has no Docker API
   access and does not mount the Docker socket. If Frigate's API cannot recover,
   the transition reports `error` and an operator restarts Frigate externally.
-- Loop mode uses TWO engage restarts — restart #1 (freeze, privacy on) and,
-  after the background loop upgrade, restart #2 (swap the loops in). Freeze mode
-  uses one engage restart, and restore uses one. There is no live-swap path
-  (until the `proxy-interpose` backend of §18, design).
+- Loop mode applies twice — stage 1 (freeze) and the stage-2 loop upgrade —
+  each one `PUT` per stream when live, or restart #1 and restart #2 on the
+  restart path. Freeze mode and restore apply once. `dejavu status` `note`
+  records which path ran: `swap=live` or `restart=frigate-api`.
 
 ## 9. State machine, locking, debounce, cancellation
 
@@ -806,12 +839,12 @@ invariant.
   activation is refused.
 - Recordings/detection during privacy contain the loop (that's the feature).
   Loop-seam motion blips possible in loop mode.
-- Under the default `frigate-config` backend, every engage and restore performs
-  a full Frigate restart (loop-mode engage performs two — freeze, then the
-  background loop upgrade) and therefore causes a recording/availability gap
-  while Frigate cold-boots each time. The `proxy-interpose` backend (§18,
-  design) reduces this to one restart per direction, with loop updates as ~2 s
-  proxy respawns rather than a second restart.
+- On Frigate < 0.18 (or `frigate.swap: restart`, or when the live swap falls
+  back) every engage and restore performs a full Frigate restart (loop-mode
+  engage performs two — freeze, then the background loop upgrade) and therefore
+  causes a recording/availability gap while Frigate cold-boots each time. The
+  live swap (§8) on Frigate ≥ 0.18 replaces that with a few-second gap on the
+  affected cameras only.
 - No scheduling, no per-camera partial privacy UI, no auth beyond the bearer
   token, no built-in TLS (use an authenticated TLS reverse proxy when needed).
 - Frozen-frame clips re-encode once at capture (CPU seconds, one-off); loop
@@ -1012,13 +1045,48 @@ go2rtc 1.9.10 reference architecture in §2.
   a 22-camera profile prepares in ~3 waves. Loop assembly runs in parallel in the
   background (stage 2) after restart #1, so it no longer delays privacy.
 
+### Restart-free swap (verified live 2026-09-17, Frigate 0.18.0 / go2rtc 1.9.14)
+
+- **Frigate 0.18 toggles a camera at runtime**: `<cam>/enabled/set` (MQTT or the
+  `/ws` bridge) → dispatcher `_on_enabled_command` → the camera process stops or
+  starts ALL its ffmpeg; `config.yml` untouched; `enabled/state` echoed
+  (retained on MQTT). `ON` is refused for a camera disabled in config.
+- **The `/ws` bridge is admin on the internal port**: `/auth` answers every
+  :5000 request as `remote-user: anonymous`, `remote-role: admin`, and nginx
+  runs `/ws` through the same auth_request, so command topics are accepted with
+  no login. Without a role header the bridge fails closed (viewer).
+- **Runtime state is only on the bridge**: `{"topic":"onConnect"}` answers with
+  `camera_activity`, whose `config.enabled` is the runtime flag. `/api/config`
+  reports the file value and keeps `{FRIGATE_*}` placeholders unexpanded.
+- **`PUT /api/streams` replaces a stream in place**: consumers dropped, producer
+  respawned (new pid observed), so the clip inode at an unchanged path IS
+  reloaded — the deterministic stage-2 seam. It also persists into go2rtc's
+  first config file (`go2rtc_homekit.yml` here); `GET`/`POST /api/config`
+  snapshot and byte-exact restore around the swap.
+- **Frigate's consumers are identifiable**: go2rtc lists them with user agent
+  `FFmpeg Frigate/<version>`; counting those is the readiness signal.
+  `/api/stats` camera `pid`/fps are shared values NEVER zeroed on disable — a
+  proof that waited on them ran to its timeout and cost a 41 s recording gap.
+- **Measured**: producer and Frigate consumer respawned in the same second,
+  first new recording segment ~4 s after `ON`.
+- **Never `pkill -f` a pattern that can match Frigate's ffmpeg** from a test
+  harness (did, twice — Frigate's watchdog respawned it).
+- **Export API 0.18**: `POST /api/export/{cam}/start/…` answers **202**
+  `{"status":"queued"}` (the old 200/201 check rejected every export);
+  `GET /api/exports/{id}` still carries `in_progress`; `GET /api/jobs/export/{id}`
+  gives `status` (`pending|queued|running|success|failed|cancelled`) and
+  `error_message`; deletion is `POST /api/exports/delete {"ids":[…]}`
+  (`DELETE /api/export/{id}` is gone).
+
 ## 17. Roadmap
 
 ### 17.1 Hot swap without restarting Frigate
 
-Superseded by design: §18 (dejavu-owned go2rtc proxy backend). The
-`proxy-interpose` backend removes every restart except one per direction — loop
-updates become ~2 s proxy respawns.
+SHIPPED (2026-09-17) as the live swap of §8 for Frigate ≥ 0.18: per-camera
+runtime stop/start over the WebSocket bridge around a go2rtc `PUT`. No restart
+in either direction; the stage-2 loop upgrade is one `PUT` per stream. The
+coordinated restart remains the automatic fallback. §18's proxy backend is no
+longer needed for the restart problem and stays design-only.
 
 ### 17.2 Instant privacy
 
@@ -1027,8 +1095,8 @@ engages as soon as every selected stream has a safe freeze frame; loop
 discovery continues in the background and each camera moves to its best safe
 loop when one becomes available. A camera with no suitable loop stays frozen,
 and privacy is never reported as active while a selected stream remains live.
-Under the `proxy-interpose` backend (§18) the loop upgrade additionally lands
-without a second Frigate restart.
+With the live swap (§8) the loop upgrade lands without a second Frigate
+restart.
 
 ### 17.3 Switchover invisibility in the timeline (OPEN — content-side, not record erasure)
 
@@ -1059,7 +1127,7 @@ fix: if it lands there is no gap to backfill and the visual seam collapses to a
 single instantaneous swap. Not scheduled; recorded here so the goal is captured
 together with its boundary.
 
-## 18. Dejavu-owned go2rtc proxy backend (DESIGN — not implemented)
+## 18. Dejavu-owned go2rtc proxy backend (DESIGN — not implemented; the §8 live swap already removes the restarts)
 
 Status: design only. Nothing in this section is built or verified except where
 explicitly marked; §18.7 lists the proofs required before implementation.

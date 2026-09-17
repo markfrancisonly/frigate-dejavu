@@ -504,7 +504,8 @@ def start_export(api, camera, start, end):
         )
     except requests.RequestException as exc:
         raise CaptureError(f"export request failed: {exc}") from exc
-    if r.status_code not in (200, 201):
+    # 0.17 answered 200/201 synchronously; 0.18 queues the job and answers 202
+    if r.status_code not in (200, 201, 202):
         raise CaptureError(f"export rejected: HTTP {r.status_code}: {r.text[:200]}")
     try:
         export_id = r.json().get("export_id")
@@ -535,11 +536,32 @@ def _get_export(api, export_id, timeout=30):
     return entry
 
 
+def _get_export_job(api, export_id):
+    """0.18's job-queue view of an export, or None when Frigate has no job
+    record (0.17, or a pruned record)."""
+    try:
+        r = http_get(f"{api}/api/jobs/export/{export_id}", timeout=15)
+    except requests.RequestException as exc:
+        raise CaptureError(f"export job status request failed: {exc}") from exc
+    if r.status_code != 200:
+        return None
+    try:
+        job = r.json()
+    except ValueError:
+        return None
+    return job if isinstance(job, dict) else None
+
+
 def wait_export(api, export_id, cancel):
     deadline = time.monotonic() + EXPORT_TIMEOUT
     while time.monotonic() < deadline:
         if cancel:
             cancel.check()
+        job = _get_export_job(api, export_id)
+        if job and job.get("status") in ("failed", "cancelled"):
+            raise CaptureError(
+                f"export {job['status']}: {job.get('error_message') or 'no detail'}"
+            )
         entry = _get_export(api, export_id)
         if entry is not None and not entry.get("in_progress"):
             return entry
@@ -567,10 +589,24 @@ def download_export(api, entry, dest, cancel):
 
 
 def delete_export(api, export_id):
-    """Delete the exact export returned by Frigate."""
+    """Delete the exact export returned by Frigate: 0.18's bulk endpoint, else
+    (0.17, or an id it no longer knows) the legacy per-id route."""
     try:
+        r = http_post(
+            f"{api}/api/exports/delete", json={"ids": [export_id]}, timeout=15
+        )
+        if r.status_code == 200:
+            return
+        if r.status_code not in (404, 405):
+            log.warning(
+                "could not delete export %s: HTTP %s %s",
+                export_id,
+                r.status_code,
+                r.text[:120],
+            )
+            return
         r = http_delete(f"{api}/api/export/{export_id}", timeout=15)
-        if r.status_code not in (200, 204, 404):
+        if r.status_code not in (200, 204, 404, 405):
             log.warning("could not delete export %s: HTTP %s", export_id, r.status_code)
     except requests.RequestException as exc:
         log.warning("could not delete export %s: %s", export_id, exc)
@@ -782,7 +818,7 @@ def frame_stats(path, cancel=None, tail=False):
             "-frames:v",
             "1",
             "-vf",
-            "scale=16:16:in_range=auto:out_range=full," "format=yuv444p",
+            "scale=16:16:in_range=auto:out_range=full,format=yuv444p",
             "-f",
             "rawvideo",
             "-",
@@ -1401,8 +1437,7 @@ def frame_from_recordings(
             except CaptureError as exc:
                 reasons.append(str(exc))
                 log.warning(
-                    "%s: direct freeze extraction failed (%s) — trying Frigate "
-                    "export",
+                    "%s: direct freeze extraction failed (%s) — trying Frigate export",
                     stream,
                     exc,
                 )
@@ -1557,7 +1592,7 @@ def source_clip_from_recordings(
                     raise
                 reasons.append(str(exc))
                 log.warning(
-                    "%s: direct loop assembly failed (%s) — trying Frigate " "export",
+                    "%s: direct loop assembly failed (%s) — trying Frigate export",
                     stream,
                     exc,
                 )

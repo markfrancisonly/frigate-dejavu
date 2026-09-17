@@ -16,6 +16,12 @@ services:
     restart: unless-stopped
     init: true                        # reap the short-lived ffmpeg children
 
+    # Optional: Frigate's FRIGATE_* secrets, so the live swap can PUT the
+    # original go2rtc sources back on 'off' (dejavu expands {FRIGATE_*} exactly
+    # as Frigate's go2rtc generator does). Without them 'off' falls back to a
+    # coordinated restart.
+    # env_file:
+    #   - ../frigate/.env
     environment:
       TZ: Etc/UTC
       DEJAVU_CONFIG: /config/config.yaml
