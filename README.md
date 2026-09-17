@@ -294,6 +294,15 @@ Profiles are mutually exclusive, so select `Off` before changing active profiles
   Frigate once per apply and lets `go2rtc` and Frigate consumers rebuild in the
   correct order. `dejavu status` shows which ran (`swap=live` /
   `restart=frigate-api`).
+- Push-fed streams (for example, tablet WebRTC publishers) require the restart
+  path for the whole apply when any selected stream has an external producer.
+  go2rtc's live `PUT` would orphan its publisher without disconnecting it, so
+  the tablet would never know to reconnect. Déjà Vu remembers detected push
+  feeds through loop upgrades and restore. Excluding those stream names in
+  `streams.exclude` keeps a pull-only default profile eligible for live swaps;
+  excluded feeds remain live during privacy. An already orphaned publisher must
+  first reconnect (reload its publisher page or restart Frigate); it is no
+  longer visible in the stream listing used for detection.
 - Offline cameras freeze on their ladder rung (live frame → recorded frame →
   cached frame → black, visible in status and logs) and can still upgrade to a
   loop of their own recent recordings when any exist in the search window —

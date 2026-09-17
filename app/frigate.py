@@ -246,6 +246,24 @@ class FrigateClient:
         except FrigateError:
             return False
 
+    @staticmethod
+    def push_fed_streams(streams_json):
+        """Streams with an external producer that go2rtc cannot dial again.
+
+        Idle configured producers have a url; connected pull producers may
+        report their configured input as source instead. External publishers
+        have neither (or the sentinel 'external'). A remote_addr alone is not
+        sufficient: ordinary RTSP pulls have one too.
+        """
+        return {
+            name
+            for name, entry in streams_json.items()
+            for producer in (entry or {}).get("producers") or []
+            if producer.get("url") == "external"
+            or producer.get("source") == "external"
+            or (not producer.get("url") and not producer.get("source"))
+        }
+
     # -- live swap (Frigate >= 0.18; SPEC §8) --------------------------------
 
     def ws_url(self):
