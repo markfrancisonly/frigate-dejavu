@@ -247,6 +247,18 @@ class FrigateClient:
             return False
 
     @staticmethod
+    def external_producers(entry):
+        """Producers a publisher pushed in (no configured url/source), i.e. what
+        go2rtc cannot dial again by itself."""
+        return sum(
+            1
+            for producer in (entry or {}).get("producers") or []
+            if producer.get("url") == "external"
+            or producer.get("source") == "external"
+            or (not producer.get("url") and not producer.get("source"))
+        )
+
+    @staticmethod
     def push_fed_streams(streams_json):
         """Streams with an external producer that go2rtc cannot dial again.
 
@@ -348,6 +360,62 @@ class FrigateClient:
         if r.status_code != 200:
             raise FrigateError(
                 f"go2rtc rejected stream {name} (HTTP {r.status_code}): {r.text[:200]}"
+            )
+
+    def go2rtc_alias_stream(self, name, target):
+        """Make `name` a second name for the SAME stream object as `target`.
+        Stock go2rtc: a PATCH whose source is a restream URL of an existing
+        stream links the names (streams.Patch). Every producer stays attached,
+        including a pushed publisher, so parking a stream under an alias keeps
+        its inbound feed alive while the public name is replaced."""
+        params = [("name", name), ("src", f"rtsp://127.0.0.1:8554/{target}")]
+        try:
+            r = _request(
+                "PATCH", f"{self.go2rtc}/api/streams", params=params, timeout=15
+            )
+        except requests.RequestException as exc:
+            raise FrigateError(
+                f"go2rtc PATCH /api/streams {name} failed: {exc}"
+            ) from exc
+        if r.status_code != 200:
+            raise FrigateError(
+                f"go2rtc refused alias {name} -> {target} (HTTP {r.status_code}): "
+                f"{r.text[:200]}"
+            )
+
+    def go2rtc_set_source(self, name, source):
+        """Rewrite the configured source of an EXISTING stream object in place
+        (stock go2rtc `streams.Patch` -> `Stream.SetSource`): only the URL the
+        next dial uses changes, every attached producer, publishers included,
+        stays connected. Single source only (that is what PATCH takes)."""
+        params = [("name", name), ("src", source)]
+        try:
+            r = _request(
+                "PATCH", f"{self.go2rtc}/api/streams", params=params, timeout=15
+            )
+        except requests.RequestException as exc:
+            raise FrigateError(
+                f"go2rtc PATCH /api/streams {name} failed: {exc}"
+            ) from exc
+        if r.status_code != 200:
+            raise FrigateError(
+                f"go2rtc refused to re-source {name} (HTTP {r.status_code}): {r.text[:200]}"
+            )
+
+    def go2rtc_delete_stream(self, name):
+        """Drop a NAME from go2rtc's table (the object lives on under any other
+        name that still points at it)."""
+        try:
+            r = _request(
+                "DELETE", f"{self.go2rtc}/api/streams", params={"src": name}, timeout=15
+            )
+        except requests.RequestException as exc:
+            raise FrigateError(
+                f"go2rtc DELETE /api/streams {name} failed: {exc}"
+            ) from exc
+        if r.status_code != 200:
+            raise FrigateError(
+                f"go2rtc refused to delete {name} (HTTP {r.status_code}): {r.text[:200]}"
             )
 
     def go2rtc_config_read(self):

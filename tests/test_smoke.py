@@ -1,5 +1,4 @@
 import copy
-import json
 import os
 import sys
 import tempfile
@@ -1246,24 +1245,107 @@ class LiveSwapTests(unittest.TestCase):
             frigate.FrigateClient.push_fed_streams(js),
         )
 
-    def test_any_planned_push_stream_restarts_the_whole_apply(self):
-        for direction in ("on", "off"):
-            with self.subTest(direction=direction):
-                job = self._job()
-                job.client.go2rtc_streams.return_value = {
-                    "tablet": {"producers": [{"remote_addr": "192.0.2.1:1234"}]}
-                }
-                swaps = {
-                    "front": {"sources": ["rtsp://cam"], "cameras": ["front_door"]},
-                    "tablet": {"sources": ["ffmpeg:tablet"], "cameras": ["tablet"]},
-                }
-                with self.assertLogs("dejavu", level="INFO") as logs:
-                    how = job.apply(swaps, {}, direction)
-                self.assertEqual(core.NOTE_RESTART, how)
-                self.assertIn("push-fed streams: tablet", "\n".join(logs.output))
-                job.client.set_camera_enabled.assert_not_called()
-                job.client.go2rtc_put_stream.assert_not_called()
-                job.client.restart_api.assert_called_once_with()
+    def test_publisher_stream_is_parked_under_an_alias_on_engage(self):
+        job = self._job()
+        job.client.camera_states.return_value = {"front_door": True, "tablet": True}
+        job.client.go2rtc_streams.return_value = {
+            "tablet": {
+                "producers": [
+                    {"url": "ffmpeg:tablet#video=h264"},
+                    {"remote_addr": "192.0.2.1:1234", "protocol": "webrtc"},
+                ]
+            },
+            "front": {"producers": [{"url": "rtsp://cam"}]},
+        }
+        calls = []
+        for name in (
+            "set_camera_enabled",
+            "go2rtc_alias_stream",
+            "go2rtc_put_stream",
+            "go2rtc_delete_stream",
+        ):
+            getattr(job.client, name).side_effect = (
+                lambda n: lambda *a: calls.append((n, *a))
+            )(name)
+        record = {
+            "front": {"cameras": ["front_door"]},
+            "tablet": {"cameras": ["tablet"]},
+        }
+        swaps = {
+            "front": {"sources": ["ffmpeg:/f.mp4"], "cameras": ["front_door"]},
+            "tablet": {"sources": ["ffmpeg:/t.mp4"], "cameras": ["tablet"]},
+        }
+        with mock.patch.object(core.Job, "_wait_consumers", return_value=[]):
+            with mock.patch.object(
+                frigate, "verify_dejavu_applied", return_value=(True, [])
+            ):
+                self.assertEqual(core.NOTE_LIVE, job.apply(swaps, {}, "on", record))
+        self.assertEqual(
+            [
+                ("set_camera_enabled", "front_door", False),
+                ("set_camera_enabled", "tablet", False),
+                ("go2rtc_alias_stream", "dejavu.keep.tablet", "tablet"),
+                ("go2rtc_put_stream", "front", ["ffmpeg:/f.mp4"]),
+                ("go2rtc_put_stream", "tablet", ["ffmpeg:/t.mp4"]),
+                ("set_camera_enabled", "front_door", True),
+                ("set_camera_enabled", "tablet", True),
+            ],
+            calls,
+        )
+        self.assertEqual("dejavu.keep.tablet", record["tablet"]["alias"])
+        saved = job.store.write_streams_record.call_args.args[0]
+        self.assertEqual("dejavu.keep.tablet", saved["streams"]["tablet"]["alias"])
+        self.assertEqual("test", saved["session"])
+        job.client.restart_api.assert_not_called()
+
+    def test_restore_points_the_public_name_back_at_the_parked_object(self):
+        job = self._job()
+        job.client.camera_states.return_value = {"tablet": True}
+        job.client.go2rtc_streams.return_value = {
+            "tablet": {"producers": [{"url": "ffmpeg:/t.mp4"}]},
+            "dejavu.keep.tablet": {
+                "producers": [
+                    {"url": "ffmpeg:tablet#video=h264"},
+                    {"remote_addr": "192.0.2.1:1234"},
+                ]
+            },
+        }
+        calls = []
+        for name in (
+            "set_camera_enabled",
+            "go2rtc_alias_stream",
+            "go2rtc_put_stream",
+            "go2rtc_delete_stream",
+        ):
+            getattr(job.client, name).side_effect = (
+                lambda n: lambda *a: calls.append((n, *a))
+            )(name)
+        record = {
+            "tablet": {
+                "cameras": ["tablet"],
+                "alias": "dejavu.keep.tablet",
+                "original_sources": ["ffmpeg:tablet#video=h264"],
+            }
+        }
+        swaps = {
+            "tablet": {"sources": ["ffmpeg:tablet#video=h264"], "cameras": ["tablet"]}
+        }
+        with mock.patch.object(core.Job, "_wait_consumers", return_value=[]):
+            with mock.patch.object(
+                frigate, "verify_dejavu_removed", return_value=(True, [])
+            ):
+                how = job.apply(swaps, {"tablet": "tablet.dejavu.mp4"}, "off", record)
+        self.assertEqual(core.NOTE_LIVE, how)
+        self.assertEqual(
+            [
+                ("set_camera_enabled", "tablet", False),
+                ("go2rtc_alias_stream", "tablet", "dejavu.keep.tablet"),
+                ("go2rtc_delete_stream", "dejavu.keep.tablet"),
+                ("set_camera_enabled", "tablet", True),
+            ],
+            calls,
+        )
+        job.client.restart_api.assert_not_called()
 
     def test_push_stream_outside_plan_keeps_pull_stream_live(self):
         job = self._job()
@@ -1286,68 +1368,140 @@ class LiveSwapTests(unittest.TestCase):
         job.client.go2rtc_put_stream.assert_not_called()
         job.client.restart_api.assert_called_once_with()
 
-    def test_push_provenance_survives_until_restore_in_a_new_job(self):
+    def test_restore_restarts_when_the_parked_name_is_gone(self):
+        swaps = {"tablet": {"sources": ["ffmpeg:tablet"], "cameras": ["tablet"]}}
         job = self._job()
         job.client.go2rtc_streams.return_value = {
-            "tablet": {"producers": [{"url": "external"}]}
+            "tablet": {"producers": [{"url": "ffmpeg:/t.mp4"}]}
+        }
+        record = {"tablet": {"cameras": ["tablet"], "alias": "dejavu.keep.tablet"}}
+        self.assertEqual(core.NOTE_RESTART, job.apply(swaps, {}, "off", record))
+        job.client.set_camera_enabled.assert_not_called()
+        job.client.go2rtc_put_stream.assert_not_called()
+        job.client.restart_api.assert_called_once_with()
+
+    def test_restore_follows_a_publisher_that_moved_to_the_clip_stream(self):
+        # the tablet reconnected while private: its publish now sits on the clip
+        # object and the parked object is dead. Re-source the clip object in place.
+        job = self._job()
+        job.client.camera_states.return_value = {"tablet": True}
+        job.client.go2rtc_streams.return_value = {
+            "tablet": {
+                "producers": [{"url": "ffmpeg:/t.mp4"}, {"remote_addr": "192.0.2.1:1"}]
+            },
+            "dejavu.keep.tablet": {"producers": [{"url": "ffmpeg:tablet#video=h264"}]},
+        }
+        calls = []
+        for name in (
+            "set_camera_enabled",
+            "go2rtc_alias_stream",
+            "go2rtc_set_source",
+            "go2rtc_put_stream",
+            "go2rtc_delete_stream",
+        ):
+            getattr(job.client, name).side_effect = (
+                lambda n: lambda *a: calls.append((n, *a))
+            )(name)
+        record = {"tablet": {"cameras": ["tablet"], "alias": "dejavu.keep.tablet"}}
+        swaps = {
+            "tablet": {"sources": ["ffmpeg:tablet#video=h264"], "cameras": ["tablet"]}
+        }
+        with mock.patch.object(core.Job, "_wait_consumers", return_value=[]):
+            with mock.patch.object(
+                frigate, "verify_dejavu_removed", return_value=(True, [])
+            ):
+                how = job.apply(swaps, {"tablet": "tablet.dejavu.mp4"}, "off", record)
+        self.assertEqual(core.NOTE_LIVE, how)
+        self.assertEqual(
+            [
+                ("set_camera_enabled", "tablet", False),
+                ("go2rtc_set_source", "tablet", "ffmpeg:tablet#video=h264"),
+                ("go2rtc_delete_stream", "dejavu.keep.tablet"),
+                ("set_camera_enabled", "tablet", True),
+            ],
+            calls,
+        )
+        job.client.restart_api.assert_not_called()
+
+    def test_restore_with_a_moved_publisher_and_multi_source_original_restarts(self):
+        job = self._job()
+        job.client.go2rtc_streams.return_value = {
+            "tablet": {"producers": [{"url": "ffmpeg:/t.mp4"}, {"remote_addr": "x"}]}
+        }
+        swaps = {"tablet": {"sources": ["rtsp://a", "rtsp://b"], "cameras": ["tablet"]}}
+        self.assertEqual(core.NOTE_RESTART, job.apply(swaps, {}, "off", {}))
+        job.client.set_camera_enabled.assert_not_called()
+        job.client.restart_api.assert_called_once_with()
+
+    def test_loop_upgrade_reparks_a_publisher_that_moved(self):
+        job = self._job()
+        job.client.camera_states.return_value = {"tablet": True}
+        job.client.go2rtc_streams.return_value = {
+            "tablet": {"producers": [{"url": "ffmpeg:/t.mp4"}, {"remote_addr": "x"}]},
+            "dejavu.keep.tablet": {"producers": [{"url": "ffmpeg:tablet#video=h264"}]},
+        }
+        calls = []
+        for name in (
+            "set_camera_enabled",
+            "go2rtc_alias_stream",
+            "go2rtc_set_source",
+            "go2rtc_put_stream",
+            "go2rtc_delete_stream",
+        ):
+            getattr(job.client, name).side_effect = (
+                lambda n: lambda *a: calls.append((n, *a))
+            )(name)
+        record = {
+            "tablet": {
+                "dejavu_source": "ffmpeg:/t.mp4",
+                "cameras": ["tablet"],
+                "alias": "dejavu.keep.tablet",
+            }
+        }
+        with mock.patch.object(core.Job, "_wait_consumers", return_value=[]):
+            with mock.patch.object(
+                frigate, "verify_dejavu_applied", return_value=(True, [])
+            ):
+                self.assertEqual(
+                    (True, core.NOTE_LIVE), job.apply_loops(record, ["tablet"])
+                )
+        self.assertEqual(
+            [
+                ("set_camera_enabled", "tablet", False),
+                ("go2rtc_alias_stream", "dejavu.keep.tablet", "tablet"),
+                ("go2rtc_put_stream", "tablet", ["ffmpeg:/t.mp4"]),
+                ("set_camera_enabled", "tablet", True),
+            ],
+            calls,
+        )
+        job.client.restart_api.assert_not_called()
+
+    def test_loop_upgrade_leaves_a_parked_publisher_alone(self):
+        job = self._job()
+        job.client.camera_states.return_value = {"tablet": True}
+        job.client.go2rtc_streams.return_value = {
+            "tablet": {"producers": [{"url": "ffmpeg:/t.mp4"}]},
+            "dejavu.keep.tablet": {"producers": [{"remote_addr": "192.0.2.1:1234"}]},
         }
         record = {
-            "tablet": {"original_sources": ["ffmpeg:tablet"], "cameras": ["tablet"]}
+            "tablet": {
+                "dejavu_source": "ffmpeg:/t.mp4",
+                "cameras": ["tablet"],
+                "alias": "dejavu.keep.tablet",
+            }
         }
-        swaps = {"tablet": {"sources": ["ffmpeg:/clip.mp4"], "cameras": ["tablet"]}}
-
-        def restart(expect, direction):
-            # Must be durable before the publisher disappears from the listing.
-            saved = job.store.write_streams_record.call_args.args[0]
-            self.assertTrue(saved["streams"]["tablet"]["push_fed"])
-            self.assertEqual("test", saved["session"])
-
-        with mock.patch.object(job, "restart_and_verify", side_effect=restart):
-            self.assertEqual(core.NOTE_RESTART, job.apply(swaps, {}, "on", record))
-        # Round-trip through JSON to model a separate CLI process restoring.
-        saved_record = json.loads(
-            json.dumps(job.store.write_streams_record.call_args.args[0])
+        with mock.patch.object(core.Job, "_wait_consumers", return_value=[]):
+            with mock.patch.object(
+                frigate, "verify_dejavu_applied", return_value=(True, [])
+            ):
+                self.assertEqual(
+                    (True, core.NOTE_LIVE), job.apply_loops(record, ["tablet"])
+                )
+        job.client.go2rtc_put_stream.assert_called_once_with(
+            "tablet", ["ffmpeg:/t.mp4"]
         )
-        restored = self._job()
-        restored.client.go2rtc_streams.return_value = {
-            "tablet": {"producers": [{"url": "ffmpeg:/clip.mp4"}]}
-        }
-        swaps["tablet"]["sources"] = ["ffmpeg:tablet"]
-        self.assertEqual(
-            core.NOTE_RESTART,
-            restored.apply(swaps, {}, "off", saved_record["streams"]),
-        )
-        restored.client.set_camera_enabled.assert_not_called()
-        restored.client.go2rtc_put_stream.assert_not_called()
-        restored.client.restart_api.assert_called_once_with()
-
-    def test_loop_upgrade_honors_current_or_remembered_push_stream(self):
-        for remembered in (False, True):
-            with self.subTest(remembered=remembered):
-                job = self._job()
-                job.client.go2rtc_streams.return_value = {
-                    "tablet": {
-                        "producers": [
-                            {"url": "ffmpeg:/clip.mp4" if remembered else "external"}
-                        ]
-                    }
-                }
-                record = {
-                    "tablet": {
-                        "dejavu_source": "ffmpeg:/clip.mp4",
-                        "cameras": ["tablet"],
-                        "push_fed": remembered,
-                    }
-                }
-                with mock.patch.object(
-                    job, "soft_restart", return_value=True
-                ) as restart:
-                    self.assertEqual(
-                        (True, core.NOTE_RESTART), job.apply_loops(record, ["tablet"])
-                    )
-                restart.assert_called_once_with({"tablet": "tablet.dejavu.mp4"})
-                job.client.set_camera_enabled.assert_not_called()
-                job.client.go2rtc_put_stream.assert_not_called()
+        job.client.go2rtc_alias_stream.assert_not_called()
+        job.client.restart_api.assert_not_called()
 
     def test_pull_only_loop_upgrade_remains_live(self):
         job = self._job()
