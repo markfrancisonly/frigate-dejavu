@@ -581,7 +581,7 @@ class Job:
 
     # -- live swap (SPEC §8; Frigate >= 0.18) --------------------------------
 
-    def _live_plan(self, swaps):
+    def _live_plan(self, swaps, record=None):
         """Expand `{FRIGATE_*}` the way Frigate's go2rtc generator does and
         refuse what go2rtc's dynamic API cannot take. Returns (plan, reason)."""
         plan = {}
@@ -606,16 +606,45 @@ class Job:
                 "sources": sources,
                 "cameras": list(spec.get("cameras") or []),
             }
+
+        # PUT replaces the stream object without disconnecting an attached
+        # publisher. Its peer connection would keep feeding the orphan forever.
+        # Remember this before restarting: privacy clips can hide the publisher
+        # in subsequent listings, including after a dejavu process restart.
+        push_fed = {s for s in plan if (record or {}).get(s, {}).get("push_fed")}
+        try:
+            push_fed.update(
+                FrigateClient.push_fed_streams(self.client.go2rtc_streams())
+                & plan.keys()
+            )
+        except FrigateError as exc:
+            return None, f"cannot check go2rtc for push-fed streams: {exc}"
+        if push_fed:
+            if record is not None:
+                changed = False
+                for s in push_fed:
+                    if s in record and not record[s].get("push_fed"):
+                        record[s]["push_fed"] = True
+                        changed = True
+                if changed:
+                    saved = self.store.read_streams_record() or {}
+                    saved["streams"] = record
+                    self.store.write_streams_record(saved)
+            return None, (
+                f"push-fed streams: {', '.join(sorted(push_fed))}; "
+                "go2rtc PUT would orphan their publishers"
+            )
         return plan, None
 
-    def apply(self, swaps, expect_clips, direction):
+    def apply(self, swaps, expect_clips, direction, record=None):
         """Bring the RUNNING Frigate in line with the config that was just saved:
         a live swap when available (frigate.swap: auto), else — and after any
         live failure — the coordinated restart. `swaps` is
         {stream: {"sources": [...], "cameras": [...]}}. Returns the status note
-        fragment (NOTE_LIVE / NOTE_RESTART)."""
+        fragment (NOTE_LIVE / NOTE_RESTART). `record`, when supplied, retains
+        push-fed provenance for loop upgrades and restore."""
         if self.cfg["frigate"]["swap"] != "restart":
-            plan, why = self._live_plan(swaps)
+            plan, why = self._live_plan(swaps, record)
             if plan is not None:
                 ok, why = self.client.live_swap_available()
                 if ok:
@@ -649,7 +678,7 @@ class Job:
                 }
                 for s in promoted
             }
-            plan, why = self._live_plan(swaps)
+            plan, why = self._live_plan(swaps, record)
             if plan is not None:
                 ok, why = self.client.live_swap_available()
                 if ok:
@@ -776,8 +805,8 @@ class Job:
         if missing:
             # Availability, not privacy: go2rtc is verified below, Frigate's
             # watchdog keeps re-dialing, and a restart would not make an
-            # unavailable source (tablet publishers re-push on their own clock,
-            # offline cameras) come back any sooner.
+            # unavailable pull source come back any sooner. Push-fed streams
+            # are excluded from the live path by _live_plan.
             log.warning(
                 "live swap: frigate has not reconnected to %s within 20s — its "
                 "watchdog keeps retrying",
@@ -1813,7 +1842,7 @@ def cmd_on(
             s: {"sources": [replacements[s]], "cameras": record[s]["cameras"]}
             for s in replacements
         }
-        how = job.apply(swaps, expect, direction="on")
+        how = job.apply(swaps, expect, direction="on", record=record)
 
         # Enter the cancellable 'upgrading' phase BEFORE publishing state='on' +
         # upgrade_pid below, so an 'off' that arrives the instant state becomes
@@ -1997,7 +2026,7 @@ def cmd_off(cfg):
                 for s, rec in streams_rec.items()
                 if s not in result["missing"] and rec.get("original_sources")
             }
-            how = job.apply(swaps, expect, direction="off")
+            how = job.apply(swaps, expect, direction="off", record=streams_rec)
         else:
             log.info("config already clean — nothing to restore")
 
