@@ -500,17 +500,25 @@ two paths (`frigate.swap`):
   for Frigate < 0.18, a bridge that does not answer, an original source with a
   `{FRIGATE_*}` placeholder dejavu cannot expand (give it Frigate's
   environment), a source containing spaces (go2rtc's dynamic API rejects
-  them), an unavailable go2rtc stream listing, or any planned **push-fed
-  stream** (external publisher). A push-fed stream makes the WHOLE apply use
-  the restart path, before any camera toggle or PUT. Detection uses producer
-  entries without a configured `url`/`source`, or the `external` sentinel;
-  a `remote_addr` alone does not identify a push (pull producers have one too).
-  Detected streams are marked `push_fed` in the persisted stream record before
-  applying, so loop upgrades and restore retain the fallback even when the
-  privacy clip hides the external producer. `streams.exclude` can omit tablet
-  feeds to keep the default profile eligible for live swaps; those excluded
-  feeds remain live. A live swap whose verification fails also falls back —
-  the cameras are started again before restarting.
+  them), an unavailable go2rtc stream listing, a restore whose parked
+  publisher name is gone (go2rtc restarted while private) or whose stream
+  acquired a publisher while private with nothing parked, or a live swap whose
+  verification fails — the cameras are started again before restarting.
+
+**Publisher-fed streams are parked, not replaced.** A stream fed by an inbound
+push (tablet WebRTC publish; detected as a producer entry with no configured
+`url`/`source` — a `remote_addr` alone does not identify a push) keeps its
+object alive: before the `PUT`, `PATCH /api/streams?name=dejavu.keep.<stream>
+&src=rtsp://127.0.0.1:8554/<stream>` gives the SAME object a second name
+(stock go2rtc links names when the source is a restream URL of an existing
+stream), so the publisher keeps pushing into it, ignored. The public name then
+gets the clip object as usual. Restore reverses it: `PATCH <stream>
+src=rtsp://127.0.0.1:8554/dejavu.keep.<stream>` points the public name back at
+the parked object and the alias name is deleted; the publisher never saw a
+disconnect and Frigate reconnects within seconds. The alias is recorded in
+`streams.json` (`alias`). Frigate only ever dials its own camera name; the
+parked name is an internal detail. Stage-2 loop upgrades `PUT` the public name
+again and leave the parked object alone.
 
 Verification is the same for both: go2rtc `/api/streams` references every
 expected privacy clip (or no longer does, on restore); the live path also
@@ -1074,20 +1082,21 @@ go2rtc 1.9.10 reference architecture in §2.
   reloaded — the deterministic stage-2 seam. It also persists into go2rtc's
   first config file (`go2rtc_homekit.yml` here); `GET`/`POST /api/config`
   snapshot and byte-exact restore around the swap.
-- **Push publishers cannot use PUT**: the map entry gets a new stream object,
-  but the old object's external producer is never stopped. Tablet WebRTC
-  publishers keep sending into that orphan and see no disconnect, so they
-  never re-publish into the restored stream. Four tablet feeds lost recording
-  after the 2026-09-17 14:46 UTC restore; pull cameras re-dial normally. Restart
-  Frigate or reload the publisher page to recover an already orphaned feed.
-  Its external producer is no longer in the stream listing, so recover it
-  before validating detection. New jobs detect external producers and use
-  the coordinated restart for any apply containing those streams (§8),
-  retaining that provenance through restore. The hotswap fork's PATCH was
-  rejected because preserving the attached live publisher during privacy
-  would retain a path to live media. Stock go2rtc has no API to disconnect
-  those producers. Excluding tablet streams keeps pull-only plans live, at
-  the cost of leaving the excluded feeds outside privacy.
+- **Push publishers cannot simply be PUT**: the map entry gets a new stream
+  object, but the old object's external producer is never stopped (`stop()`
+  skips `stateExternal`). Tablet WebRTC publishers keep sending into that
+  orphan and see no disconnect, so they never re-publish into the restored
+  stream. Four tablet feeds lost recording after the 2026-09-17 14:46 UTC
+  restore (recovered with HA `script.wallpanel_reload`; a Frigate restart
+  works too). Pull cameras re-dial normally. Resolution (§8, verified live
+  the same day): PARK the object under a second name via stock go2rtc's
+  alias `PATCH` before the `PUT`, and point the public name back at it on
+  restore — the publisher's byte counter kept rising throughout and Frigate
+  reconnected 4 s after the camera was re-enabled. A publisher that attaches
+  while private (tablet woke up) lands on the clip object; restore then falls
+  back to the restart path. The hotswap fork's `PATCH` was rejected because
+  keeping the live publisher on the object Frigate consumes would leave a
+  path to live media.
 - **Frigate's consumers are identifiable**: go2rtc lists them with user agent
   `FFmpeg Frigate/<version>`; counting those is the readiness signal.
   `/api/stats` camera `pid`/fps are shared values NEVER zeroed on disable — a
