@@ -1134,6 +1134,14 @@ go2rtc 1.9.10 reference architecture in §2.
   `error_message`; deletion is `POST /api/exports/delete {"ids":[…]}`
   (`DELETE /api/export/{id}` is gone).
 
+- **Frigate 0.18 profiles coexist with the live swap** (verified 2026-09-17):
+  activating or deactivating a profile (`frigate/profile/set`) resets every
+  runtime toggle and republishes the changed sections, but dejavu's camera
+  toggles are transient (re-enabled within the swap) and its swap lives in
+  go2rtc plus the persisted config, which the ruamel round-trip preserves
+  `profiles:` sections through. A freeze on `office` kept serving across a
+  profile off/on flip with Frigate attached throughout; restore went live.
+
 ## 17. Roadmap
 
 ### 17.1 Hot swap without restarting Frigate
