@@ -713,6 +713,23 @@ class Job:
                 ", ".join(idle),
             )
 
+        # Only streams Frigate is consuming NOW must be consumed again afterwards.
+        # An offline camera or an on-demand publisher stream has no consumer to
+        # begin with, and a restart would not conjure one either.
+        try:
+            before = client.go2rtc_streams()
+        except FrigateError as exc:
+            raise JobError(f"go2rtc unreachable before the swap: {exc}") from exc
+        consumed = {
+            s: spec for s, spec in plan.items() if client.frigate_consumers(s, before)
+        }
+        idle_streams = sorted(set(plan) - set(consumed))
+        if idle_streams:
+            log.info(
+                "live swap: no frigate consumer on %s (offline or on-demand) — not waited for",
+                ", ".join(idle_streams),
+            )
+
         snapshot = client.go2rtc_config_read()
         log.info(
             "live swap: stopping %d camera(s), replacing %d stream(s)...",
@@ -725,7 +742,7 @@ class Job:
             for cam in targets:
                 client.set_camera_enabled(cam, False)
                 stopped.append(cam)
-            lingering = self._wait_consumers(plan, want_zero=True, timeout=10)
+            lingering = self._wait_consumers(consumed, want_zero=True, timeout=10)
             if lingering:
                 log.warning(
                     "live swap: frigate still consuming %s after stop — replacing anyway",
@@ -750,14 +767,22 @@ class Job:
                 + "; ".join(failed_start)
             )
 
-        consuming = {
+        must_return = {
             s: spec
-            for s, spec in plan.items()
+            for s, spec in consumed.items()
             if any(c in stopped for c in spec["cameras"])
         }
-        missing = self._wait_consumers(consuming, want_zero=False, timeout=30)
+        missing = self._wait_consumers(must_return, want_zero=False, timeout=20)
         if missing:
-            raise JobError("frigate did not reconnect to: " + ", ".join(missing))
+            # Availability, not privacy: go2rtc is verified below, Frigate's
+            # watchdog keeps re-dialing, and a restart would not make an
+            # unavailable source (tablet publishers re-push on their own clock,
+            # offline cameras) come back any sooner.
+            log.warning(
+                "live swap: frigate has not reconnected to %s within 20s — its "
+                "watchdog keeps retrying",
+                ", ".join(missing),
+            )
         verify = (
             frigate_mod.verify_dejavu_applied
             if direction == "on"

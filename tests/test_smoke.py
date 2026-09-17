@@ -1213,8 +1213,47 @@ class LiveSwapTests(unittest.TestCase):
         job.client.live_swap_available.return_value = (True, None)
         job.client.camera_states.return_value = {"front_door": True, "garage": False}
         job.client.go2rtc_config_read.return_value = b"streams: {}\n"
+        job.client.frigate_consumers.return_value = 1
         job.client.wait_healthy.return_value = True
         return job
+
+    def test_slow_reconnect_is_a_warning_not_a_restart(self):
+        job = self._job()
+        swaps = {"front": {"sources": ["ffmpeg:/a.mp4"], "cameras": ["front_door"]}}
+        with mock.patch.object(core.Job, "_wait_consumers", return_value=["front"]):
+            with mock.patch.object(
+                frigate, "verify_dejavu_applied", return_value=(True, [])
+            ):
+                how = job.apply(swaps, {"front": "front.dejavu.mp4"}, "on")
+        self.assertEqual(core.NOTE_LIVE, how)
+        job.client.restart_api.assert_not_called()
+
+    def test_streams_without_a_frigate_consumer_are_not_waited_for(self):
+        job = self._job()
+        job.client.camera_states.return_value = {"front_door": True, "dead_cam": True}
+        job.client.frigate_consumers.side_effect = lambda s, js=None: {"front": 1}.get(
+            s, 0
+        )
+        waits = []
+
+        def wait(plan, want_zero, timeout):
+            waits.append((sorted(plan), want_zero))
+            return []
+
+        swaps = {
+            "front": {"sources": ["ffmpeg:/a.mp4"], "cameras": ["front_door"]},
+            "dead": {"sources": ["ffmpeg:/b.mp4"], "cameras": ["dead_cam"]},
+        }
+        with mock.patch.object(core.Job, "_wait_consumers", side_effect=wait):
+            with mock.patch.object(
+                frigate, "verify_dejavu_applied", return_value=(True, [])
+            ):
+                how = job.apply(swaps, {}, "on")
+        self.assertEqual(core.NOTE_LIVE, how)
+        # the dead camera's stream is swapped but never gates the result
+        self.assertEqual([(["front"], True), (["front"], False)], waits)
+        self.assertEqual(2, job.client.go2rtc_put_stream.call_count)
+        job.client.restart_api.assert_not_called()
 
     def test_placeholders_expand_from_env_like_frigate(self):
         with mock.patch.dict(os.environ, {"FRIGATE_PW": "s3cret"}):
