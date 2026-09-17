@@ -350,6 +350,43 @@ class FrigateClient:
                 f"go2rtc rejected stream {name} (HTTP {r.status_code}): {r.text[:200]}"
             )
 
+    def go2rtc_alias_stream(self, name, target):
+        """Make `name` a second name for the SAME stream object as `target`.
+        Stock go2rtc: a PATCH whose source is a restream URL of an existing
+        stream links the names (streams.Patch). Every producer stays attached,
+        including a pushed publisher, so parking a stream under an alias keeps
+        its inbound feed alive while the public name is replaced."""
+        params = [("name", name), ("src", f"rtsp://127.0.0.1:8554/{target}")]
+        try:
+            r = _request(
+                "PATCH", f"{self.go2rtc}/api/streams", params=params, timeout=15
+            )
+        except requests.RequestException as exc:
+            raise FrigateError(
+                f"go2rtc PATCH /api/streams {name} failed: {exc}"
+            ) from exc
+        if r.status_code != 200:
+            raise FrigateError(
+                f"go2rtc refused alias {name} -> {target} (HTTP {r.status_code}): "
+                f"{r.text[:200]}"
+            )
+
+    def go2rtc_delete_stream(self, name):
+        """Drop a NAME from go2rtc's table (the object lives on under any other
+        name that still points at it)."""
+        try:
+            r = _request(
+                "DELETE", f"{self.go2rtc}/api/streams", params={"src": name}, timeout=15
+            )
+        except requests.RequestException as exc:
+            raise FrigateError(
+                f"go2rtc DELETE /api/streams {name} failed: {exc}"
+            ) from exc
+        if r.status_code != 200:
+            raise FrigateError(
+                f"go2rtc refused to delete {name} (HTTP {r.status_code}): {r.text[:200]}"
+            )
+
     def go2rtc_config_read(self):
         """Bytes of go2rtc's FIRST config file, the one dynamic PUTs persist
         into (SPEC §16); None when go2rtc has no config file."""

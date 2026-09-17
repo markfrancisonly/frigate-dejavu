@@ -57,6 +57,8 @@ BACKUP_KEEP = 10
 # How the saved config reached the running Frigate (status `note` prefix).
 NOTE_LIVE = "swap=live"
 NOTE_RESTART = "restart=frigate-api"
+# go2rtc name under which a publisher-fed stream object is parked while private.
+DEJAVU_ALIAS_PREFIX = "dejavu.keep."
 
 
 def _how_text(how):
@@ -581,7 +583,7 @@ class Job:
 
     # -- live swap (SPEC §8; Frigate >= 0.18) --------------------------------
 
-    def _live_plan(self, swaps, record=None):
+    def _live_plan(self, swaps):
         """Expand `{FRIGATE_*}` the way Frigate's go2rtc generator does and
         refuse what go2rtc's dynamic API cannot take. Returns (plan, reason)."""
         plan = {}
@@ -607,33 +609,6 @@ class Job:
                 "cameras": list(spec.get("cameras") or []),
             }
 
-        # PUT replaces the stream object without disconnecting an attached
-        # publisher. Its peer connection would keep feeding the orphan forever.
-        # Remember this before restarting: privacy clips can hide the publisher
-        # in subsequent listings, including after a dejavu process restart.
-        push_fed = {s for s in plan if (record or {}).get(s, {}).get("push_fed")}
-        try:
-            push_fed.update(
-                FrigateClient.push_fed_streams(self.client.go2rtc_streams())
-                & plan.keys()
-            )
-        except FrigateError as exc:
-            return None, f"cannot check go2rtc for push-fed streams: {exc}"
-        if push_fed:
-            if record is not None:
-                changed = False
-                for s in push_fed:
-                    if s in record and not record[s].get("push_fed"):
-                        record[s]["push_fed"] = True
-                        changed = True
-                if changed:
-                    saved = self.store.read_streams_record() or {}
-                    saved["streams"] = record
-                    self.store.write_streams_record(saved)
-            return None, (
-                f"push-fed streams: {', '.join(sorted(push_fed))}; "
-                "go2rtc PUT would orphan their publishers"
-            )
         return plan, None
 
     def apply(self, swaps, expect_clips, direction, record=None):
@@ -641,15 +616,15 @@ class Job:
         a live swap when available (frigate.swap: auto), else — and after any
         live failure — the coordinated restart. `swaps` is
         {stream: {"sources": [...], "cameras": [...]}}. Returns the status note
-        fragment (NOTE_LIVE / NOTE_RESTART). `record`, when supplied, retains
-        push-fed provenance for loop upgrades and restore."""
+        fragment (NOTE_LIVE / NOTE_RESTART). `record` (streams.json's per-stream
+        dict) carries the parked-publisher aliases between engage and restore."""
         if self.cfg["frigate"]["swap"] != "restart":
-            plan, why = self._live_plan(swaps, record)
+            plan, why = self._live_plan(swaps)
             if plan is not None:
                 ok, why = self.client.live_swap_available()
                 if ok:
                     try:
-                        self.apply_live(plan, expect_clips, direction)
+                        self.apply_live(plan, expect_clips, direction, record)
                         return NOTE_LIVE
                     except (JobError, FrigateError) as exc:
                         log.warning(
@@ -678,12 +653,12 @@ class Job:
                 }
                 for s in promoted
             }
-            plan, why = self._live_plan(swaps, record)
+            plan, why = self._live_plan(swaps)
             if plan is not None:
                 ok, why = self.client.live_swap_available()
                 if ok:
                     try:
-                        self.apply_live(plan, expect, "on")
+                        self.apply_live(plan, expect, "on", record)
                         return True, NOTE_LIVE
                     except (JobError, FrigateError) as exc:
                         log.warning(
@@ -694,6 +669,11 @@ class Job:
             if why:
                 log.info("live swap unavailable (%s) — loop upgrade via restart", why)
         return self.soft_restart(expect), NOTE_RESTART
+
+    def _persist_record(self, record):
+        saved = self.store.read_streams_record() or {}
+        saved["streams"] = record
+        self.store.write_streams_record(saved)
 
     def _wait_consumers(self, plan, want_zero, timeout):
         """Poll go2rtc until each stream's Frigate consumer count is zero (after
@@ -715,14 +695,20 @@ class Job:
                 time.sleep(0.5)
         return sorted(pending)
 
-    def apply_live(self, plan, expect_clips, direction):
+    def apply_live(self, plan, expect_clips, direction, record=None):
         """Stop every affected camera, PUT every stream into the running go2rtc,
         start the cameras again, verify. Frigate is never restarted; cameras
         outside the plan are untouched; cameras the operator disabled at runtime
         stay disabled. go2rtc persists dynamic PUTs into its first config file
         (SPEC §16), so that file is snapshotted and written back byte-exact.
         Any failure starts what was stopped, then raises so the caller can fall
-        back to a restart (the config is already saved for it)."""
+        back to a restart (the config is already saved for it).
+
+        A stream fed by an inbound publisher (tablet WebRTC push) is PARKED
+        first: its object gets a second go2rtc name, so the publisher keeps
+        pushing into it, ignored, while the public name gets the clip. Restore
+        points the public name back at the parked object and drops the alias,
+        so the publisher never notices. Frigate only ever dials its own name."""
         client = self.client
         states = client.camera_states()
         cameras = list(
@@ -759,6 +745,33 @@ class Job:
                 ", ".join(idle_streams),
             )
 
+        pushed = FrigateClient.push_fed_streams(before) & set(plan)
+        record = record if record is not None else {}
+        park, unpark = {}, {}
+        for s in plan:
+            alias = (record.get(s) or {}).get("alias")
+            if direction == "on":
+                if s in pushed and not alias:
+                    park[s] = f"{DEJAVU_ALIAS_PREFIX}{s}"
+            elif alias:
+                if alias not in before:
+                    raise JobError(
+                        f"{s}: parked publisher name {alias} is gone (go2rtc restarted "
+                        "while private) — restoring it needs a restart"
+                    )
+                unpark[s] = alias
+            elif s in pushed:
+                raise JobError(
+                    f"{s}: a publisher attached itself while private and nothing is "
+                    "parked — restoring it needs a restart"
+                )
+        if park:
+            log.info(
+                "live swap: parking publisher-fed %s under an alias so the inbound "
+                "feed stays connected",
+                ", ".join(sorted(park)),
+            )
+
         snapshot = client.go2rtc_config_read()
         log.info(
             "live swap: stopping %d camera(s), replacing %d stream(s)...",
@@ -777,8 +790,17 @@ class Job:
                     "live swap: frigate still consuming %s after stop — replacing anyway",
                     ", ".join(lingering),
                 )
+            for stream, alias in park.items():
+                client.go2rtc_alias_stream(alias, stream)
+                record.setdefault(stream, {})["alias"] = alias
+            if park:
+                self._persist_record(record)
             for stream, spec in plan.items():
-                client.go2rtc_put_stream(stream, spec["sources"])
+                if stream in unpark:
+                    client.go2rtc_alias_stream(stream, unpark[stream])
+                    client.go2rtc_delete_stream(unpark[stream])
+                else:
+                    client.go2rtc_put_stream(stream, spec["sources"])
         finally:
             for cam in stopped:
                 try:
@@ -805,8 +827,7 @@ class Job:
         if missing:
             # Availability, not privacy: go2rtc is verified below, Frigate's
             # watchdog keeps re-dialing, and a restart would not make an
-            # unavailable pull source come back any sooner. Push-fed streams
-            # are excluded from the live path by _live_plan.
+            # unavailable pull source come back any sooner.
             log.warning(
                 "live swap: frigate has not reconnected to %s within 20s — its "
                 "watchdog keeps retrying",
