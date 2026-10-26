@@ -48,6 +48,26 @@ docker compose config
 docker compose up -d
 ```
 
+### The image
+
+CI publishes the image to the GitHub Container Registry for linux/amd64 and
+linux/arm64, once the tests and a smoke test of the built image pass:
+
+| Tag | Points at |
+|---|---|
+| `latest` | the newest build of `master` or of a stable release |
+| `sha-<commit>` | one exact commit, e.g. `sha-16558e7`; it never moves |
+| `1.2.3`, `1.2`, `1` | the release tag `v1.2.3` |
+
+`compose.example.yaml` already pulls it:
+
+```yaml
+image: ghcr.io/markfrancisonly/frigate-dejavu:latest
+```
+
+To run your own changes instead, replace `image:` with `build: .` and start
+with `docker compose up -d --build`.
+
 Common controls:
 
 ```sh
