@@ -110,8 +110,7 @@ Déjà Vu -> Frigate REST API: validate config, save sources, apply (live swap
   switch-off falls back to a restart.
 
 Different addresses, mounts, and camera brands are expected. Changing the
-topology or restart model requires revalidation; see SPEC §2 for the verified
-production versions and constraints.
+topology or restart model requires revalidation.
 
 ## REST API
 
